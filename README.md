@@ -89,6 +89,12 @@ Released under the MIT License — see `LICENSE`.
 
 ## Citation
 
-Please cite the accompanying manuscript (Kim & Franke) and this archive's Zenodo
-DOI. Published datasets re-used here retain their original accessions
-(see `datasets.yaml`).
+If you use this code, please cite the accompanying preprint:
+
+> de Carvalho Neves J, El Khazen N, Smith C, Franke V, Mankhong S, Jauliac E,
+> Yedigaryan L, Lefebvre E, Akalin A, Maire P, Kim M. *Local translational program
+> at the muscle–tendon junction endows domain identity in muscle syncytia.*
+> bioRxiv (2026). doi:[10.64898/2026.01.01.697307](https://doi.org/10.64898/2026.01.01.697307)
+
+and this code archive's Zenodo DOI. Published datasets re-used here retain their
+original accessions (see `datasets.yaml`).
