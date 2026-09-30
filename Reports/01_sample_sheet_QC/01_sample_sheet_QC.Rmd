@@ -1,0 +1,160 @@
+---
+title: "01 — Sample sheet & cohort QC"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Role.** Quality-control gate for the sample sheet and salmon counts that feed every downstream report (02–07). It verifies that all expected samples are present and parseable, that replicates are correctly grouped by cohort/cell_type/condition, and that per-sample counts are sane (adequate depth, expected replicate structure, no rogue outliers) before any differential analysis is run.
+
+<!--
+# Canvas: Prompts/canvases/001_sample-sheet-qc.md
+Upstream dependencies:
+  Documentation/sample_sheet.tsv  (Phase 0.4)
+  Scripts/Bin/Sample_Sheet.R      (load_sample_sheet, load_salmon_counts)
+Downstream: every later report.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(DESeq2)
+    library(SummarizedExperiment)
+    library(ComplexHeatmap)
+    library(RColorBrewer)
+})
+source.lib("ScanLib.R")
+source.pro("Sample_Sheet.R")
+
+# tximport salmon counts are estimates (non-integer); the documented DESeq2 path
+# is DESeqDataSetFromTximport, which uses the per-transcript length matrix as a
+# normalization offset rather than rounding. Reconstruct the txi list from the SE.
+dds_from_se = function(se) DESeqDataSetFromTximport(
+    txi = list(counts    = assay(se, "counts"),
+               abundance = assay(se, "abundance"),
+               length    = assay(se, "length"),
+               countsFromAbundance = "no"),
+    colData = as.data.frame(colData(se)),
+    design  = ~ 1)
+
+report_name = "01_sample_sheet_QC"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+```
+
+## Sample metadata
+
+```{r}
+ss = load_sample_sheet()
+knitr::kable(
+    ss %>% dplyr::count(cohort, cell_type, fraction, tag, condition),
+    caption = "Sample counts per cohort × cell_type × fraction × tag × condition."
+)
+write.table(ss,
+    file      = file.path(outpath, DateNamer("table_sample_metadata.tsv")),
+    sep       = "\t",
+    quote     = FALSE,
+    row.names = FALSE)
+```
+
+*Input:* `Documentation/sample_sheet.tsv` (34 samples across three cohorts).
+*Method:* `load_sample_sheet()` reads and validates the TSV; missing BAM/salmon paths trigger warnings.
+*Shows:* how many biological replicates are available per condition — drives downstream DE feasibility.
+
+## Figure 1 — Library sizes
+
+*Why this figure:* Low-depth libraries inflate dispersion estimates and weaken DE power downstream, so depth must be checked before any sample enters a model. This flags samples that are too shallow to trust or grossly over-/under-sequenced relative to their cohort.
+
+```{r fig1_lib_size, fig.width=8, fig.height=4}
+se_list = lapply(split(ss, ss$cohort), function(s) {
+    load_salmon_counts(sample_sheet = ss, cohort = unique(s$cohort))
+})
+
+lib = bind_rows(lapply(names(se_list), function(c) {
+    tibble(cohort      = c,
+           sample_id   = colnames(se_list[[c]]),
+           total_counts = colSums(assay(se_list[[c]], "counts")))
+}))
+
+ggplot(lib, aes(x = reorder(sample_id, total_counts), y = total_counts / 1e6, fill = cohort)) +
+    geom_col() +
+    facet_wrap(~ cohort, scales = "free_y", ncol = 1) +
+    coord_flip() +
+    labs(x = NULL, y = "Total mapped reads (M)") +
+    globals$theme
+ggsave(file.path(outpath, DateNamer("bar_library_size.pdf")), width = 8, height = 6)
+```
+
+*Input:* Salmon gene-level counts loaded via `load_salmon_counts()` per cohort.
+*Method:* `colSums()` on the raw count matrix.
+*Shows:* per-sample sequencing depth; flag outliers before DE.
+
+## Figure 2 — PCA per cohort
+
+*Why this figure:* Confirms that the dominant variance in each cohort tracks the intended biology (cell_type/condition) rather than a batch or labelling error, and surfaces mis-annotated or swapped samples before they corrupt group contrasts. A sample landing far from its condition cluster is a candidate for exclusion.
+
+```{r fig2_pca, fig.width=6, fig.height=5}
+for(c in names(se_list)){
+    se   = se_list[[c]]
+    dds  = dds_from_se(se)
+    dds  = estimateSizeFactors(dds)
+    vsd  = vst(dds, blind = TRUE)
+    pca  = plotPCA(vsd, intgroup = c("cell_type","condition"), returnData = TRUE)
+    pv   = round(100 * attr(pca, "percentVar"))
+
+    g = ggplot(pca, aes(PC1, PC2, color = cell_type, shape = condition)) +
+        geom_point(size = 3) +
+        ggrepel::geom_text_repel(aes(label = name), size = 3, max.overlaps = 30) +
+        labs(title = c,
+             x = paste0("PC1: ", pv[1], "% var"),
+             y = paste0("PC2: ", pv[2], "% var")) +
+        globals$theme
+    print(g)
+    ggsave(file.path(outpath, DateNamer(paste0("scatter_PCA_", c, ".pdf"))),
+           g, width = 6, height = 5)
+}
+```
+
+*Input:* vst-normalized counts (blind = TRUE) per cohort.
+*Method:* `DESeq2::plotPCA` on top 500 variable genes, first two PCs.
+*Shows:* does replicate structure line up with biology (cell_type / condition)? Any obvious outliers that need exclusion?
+
+## Figure 3 — Sample correlation heatmap
+
+*Why this figure:* Provides a replicate-level cross-check on the PCA: pairwise correlation makes weak replicates and cross-condition contamination explicit, so we can confirm within-condition reproducibility is high enough to justify pooling replicates in downstream DE.
+
+```{r fig3_cor, fig.width=6, fig.height=5}
+for(c in names(se_list)){
+    se  = se_list[[c]]
+    dds = dds_from_se(se)
+    vsd = vst(dds, blind = TRUE)
+    cor_mat = cor(assay(vsd), method = "spearman")
+
+    h = Heatmap(cor_mat,
+                name = "Spearman",
+                col  = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+                show_row_dend = FALSE,
+                show_column_dend = FALSE,
+                column_title = c)
+    pdf(file.path(outpath, DateNamer(paste0("heatmap_sample_correlation_", c, ".pdf"))),
+        width = 6, height = 5)
+    draw(h)
+    dev.off()
+    draw(h)
+}
+```
+
+*Input:* vst matrix from the same DESeq2 object.
+*Method:* Spearman on vst-normalized expression.
+*Shows:* Replicate reproducibility per cohort. Samples within a condition should cluster together.
+
+## Session info
+
+```{r}
+sessionInfo()
+```

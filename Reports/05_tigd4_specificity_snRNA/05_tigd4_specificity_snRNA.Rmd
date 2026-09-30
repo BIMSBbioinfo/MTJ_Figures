@@ -1,0 +1,436 @@
+---
+title: "05 — Tigd4 specificity in published muscle snRNA-seq atlases"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Reviewer question — Q1.** Across published muscle snRNA-seq atlases, is *Tigd4*
+> restricted to MTJ nuclei (absent from fibroblasts and tenocytes) while *Col22a1*
+> shows a broader distribution that includes fibroblasts/tenocytes?
+>
+> **Purpose.** This report establishes *Tigd4*'s MTJ specificity relative to *Col22a1*
+> across three independent published mouse snRNA-seq datasets (Kim/Birchmeier, Petrany,
+> De Micheli), using Col22a1 as the MTJ-positive control and Pdgfra/Tnmd/Scx/Mkx as
+> fibroblast/tenocyte markers.
+
+<!--
+# Canvas: Prompts/canvases/005_tigd4-specificity-snrna.md
+Reviewer Q1: show that Tigd4 expression is restricted to MTJ nuclei and not
+to fibroblasts or tenocytes. Col22a1 is the MTJ-positive control marker;
+Pdgfra/Tnmd/Scx/Mkx are the fibroblast/tenocyte markers.
+
+External datasets (mouse, mm10, gene-symbol level integration):
+  Data/external/snRNA/kim_birchmeier_2020_E-MTAB-8623/mm10.Seurat.RDS
+  Data/external/snRNA/petrany_2020_GSE147127/GSM44189{91..96}_*.h5
+  Data/external/snRNA/demicheli_2020_GSE143437/*.txt.gz
+
+Helper: Scripts/Bin/snRNA_Loaders.R.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(ComplexHeatmap)
+    library(RColorBrewer)
+})
+source.lib("ScanLib.R")
+source.pro("snRNA_Loaders.R")
+
+report_name = "05_tigd4_specificity_snRNA"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+
+marker_panel = c("Tigd4","Col22a1","Ckm","Myh4","Myh7",   # MTJ + myofiber
+                 "Pdgfra","Tnmd","Scx","Mkx",             # fibroblast / tenocyte
+                 "Pecam1","Pax7","Mki67")                 # endothelial / MuSC / proliferating
+```
+
+## Datasets
+
+```{r}
+kim      = load_kim_birchmeier_2020()
+petrany  = load_petrany_2020()
+demich   = load_demicheli_2020()
+iscience = load_iscience_2021()
+
+datasets = list(
+    "Kim 2020 (E-MTAB-8623)"  = kim,
+    "Petrany 2020 (GSE147127)" = petrany,
+    "De Micheli 2020 (GSE143437)" = demich,
+    "iScience 2021 (GSE162307)" = iscience
+)
+
+cluster_cols = list(
+    "Kim 2020 (E-MTAB-8623)"  = if("celltype"          %in% colnames(kim@meta.data))    "celltype"
+                                else if("ClusterNames" %in% colnames(kim@meta.data))    "ClusterNames"
+                                else "seurat_clusters",
+    "Petrany 2020 (GSE147127)" = "seurat_clusters",
+    "De Micheli 2020 (GSE143437)" = if("cell_annotation" %in% colnames(demich@meta.data)) "cell_annotation"
+                                    else if("celltype"     %in% colnames(demich@meta.data)) "celltype"
+                                    else "seurat_clusters",
+    "iScience 2021 (GSE162307)" = "seurat_clusters"
+)
+```
+
+*Inputs:* three preprocessed mouse muscle snRNA-seq atlases pulled on
+2026-04-24 (`Data/external/snRNA/`). `load_*` helpers cache one Seurat
+object per dataset.
+
+## Figure 1 — UMAP per dataset, coloured by cluster annotation
+
+*Each panel is one atlas; every dot is a nucleus placed by its transcriptome (UMAP) and
+coloured by cluster — the cell-type map onto which Tigd4/Col22a1 expression is overlaid.*
+
+*Why this figure:* Q1 asks whether Tigd4 is confined to MTJ nuclei and absent from
+fibroblasts/tenocytes; that question is only answerable once the fibroblast, tenocyte
+and MTJ populations are explicitly identified — this establishes the cell-type reference
+frame for every expression overlay that follows.
+
+```{r fig1_umap, fig.width=7, fig.height=5}
+for(name in names(datasets)){
+    s   = datasets[[name]]
+    col = cluster_cols[[name]]
+    if(!"umap" %in% names(s@reductions)){
+        message("skipping UMAP for ", name, ": no umap reduction (loader did not run RunUMAP)")
+        next
+    }
+    g = DimPlot(s, group.by = col, label = TRUE, repel = TRUE) +
+        ggtitle(name) +
+        globals$theme
+    print(g)
+    ggsave(file.path(outpath,
+                     DateNamer(paste0("umap_", make.names(name), ".pdf"))),
+           g, width = 7, height = 5)
+}
+```
+
+*Method:* author-provided cluster annotation when present, otherwise
+post-load `seurat_clusters` from `load_petrany_2020()` (Louvain at
+resolution 0.6).
+*Shows:* the cell-type landscape into which Tigd4 expression must fit.
+
+## Figure 2 — Tigd4 vs Col22a1 vs control markers (feature plots)
+
+*The same UMAP, now coloured by per-nucleus expression of each marker — showing where Tigd4
+and Col22a1 (MTJ) sit relative to Pdgfra (fibroblast) and Tnmd (tenocyte) controls.*
+
+*Why this figure:* this is the direct spatial test of Q1 — overlaying Tigd4 and Col22a1
+on the same map as the fibroblast (Pdgfra) and tenocyte (Tnmd) markers shows whether
+Tigd4 cells avoid those territories while Col22a1 cells extend into them.
+
+```{r fig2_features, fig.width=10, fig.height=8}
+for(name in names(datasets)){
+    s = datasets[[name]]
+    if(!"umap" %in% names(s@reductions)){
+        message("skipping FeaturePlot for ", name, ": no umap reduction")
+        next
+    }
+    genes_present = intersect(c("Tigd4","Col22a1","Pdgfra","Tnmd"), rownames(s))
+    g = FeaturePlot(s, features = genes_present, ncol = 2,
+                    order = TRUE, pt.size = 0.3) +
+        patchwork::plot_annotation(title = name)
+    print(g)
+    ggsave(file.path(outpath,
+                     DateNamer(paste0("feature_tigd4_col22a1_", make.names(name), ".pdf"))),
+           g, width = 10, height = 8)
+}
+```
+
+*Method:* per-cell expression overlaid on the UMAP. `order = TRUE`
+plots non-zero cells on top so sparse signals don't get hidden under
+zeros.
+*Shows:* whether Tigd4-expressing cells co-localize with Col22a1+ MTJ
+myonuclei (expected) and whether they spill into Pdgfra+ fibroblasts or
+Tnmd+ tenocytes (the reviewer's concern).
+
+## Figure 3 — Marker dotplot per dataset
+
+*Per dataset, a grid of the marker panel (rows) across clusters/cell-types (columns): dot
+size = % of nuclei expressing, colour = average expression — so you can read at a glance
+which cluster a marker is restricted to.*
+
+*Why this figure:* it quantifies Q1 across all clusters at once — letting the reviewer
+confirm that Tigd4 dots collapse onto the MTJ cluster only, while Col22a1, Pdgfra and
+Tnmd dots distinguish the broader fibroblast/tenocyte compartments.
+
+```{r fig3_dotplot_fun, include=FALSE}
+make_marker_dotplot = function(name){
+    s   = datasets[[name]]
+    col = cluster_cols[[name]]
+    genes_present = intersect(marker_panel, rownames(s))
+    DotPlot(s, features = genes_present, group.by = col,
+            cols = c("lightgray","#E88C8C")) +
+        ggtitle(name) +
+        coord_flip() +
+        scale_y_discrete(expand = ggplot2::expansion(add = 0.6)) +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+save_dotplot = function(name, g, h)
+    ggsave(file.path(outpath, DateNamer(paste0("dotplot_markers_", make.names(name), ".pdf"))),
+           g, width = 10, height = h)
+demich_name = grep("Micheli", names(datasets), value = TRUE)
+```
+
+```{r fig3_dotplot, fig.width=10, fig.height=5}
+for(name in setdiff(names(datasets), demich_name)){
+    g = make_marker_dotplot(name); print(g); save_dotplot(name, g, 5)
+}
+```
+
+De Micheli has many more annotated cell types, so its dotplot is rendered taller (extended
+y-axis) so every cell type is legible:
+
+```{r fig3_dotplot_demicheli, fig.width=10, fig.height=10}
+for(name in demich_name){
+    g = make_marker_dotplot(name); print(g); save_dotplot(name, g, 10)
+}
+```
+
+*Method:* Seurat `DotPlot`. Dot size = % cells expressing; colour =
+average scaled expression.
+*Shows:* the canonical readout for whether Tigd4 is restricted to
+the same cluster(s) as Col22a1 and absent from Pdgfra+ fibroblasts /
+Tnmd+/Scx+ tenocytes.
+
+## Tigd4 specificity summary table
+
+```{r summary}
+summary_long = bind_rows(lapply(names(datasets), function(name){
+    s   = datasets[[name]]
+    col = cluster_cols[[name]]
+    if(!col %in% colnames(s@meta.data)) return(NULL)
+    marker_expression_by_cluster(
+        seurat_obj  = s,
+        cluster_col = col,
+        genes       = intersect(marker_panel, rownames(s)),
+        dataset_tag = name
+    )
+}))
+
+write.table(summary_long,
+    file      = file.path(outpath, DateNamer("table_tigd4_specificity_summary.tsv")),
+    sep       = "\t", quote = FALSE, row.names = FALSE)
+
+knitr::kable(
+    summary_long %>%
+        filter(gene %in% c("Tigd4","Col22a1","Pdgfra","Tnmd")) %>%
+        dplyr::select(dataset, cluster, gene, pct_expressing, n_cells) %>%
+        pivot_wider(names_from = gene, values_from = pct_expressing,
+                    values_fill = NA) %>%
+        arrange(dataset, desc(Tigd4)),
+    caption = "Per-cluster % cells expressing Tigd4, Col22a1, Pdgfra, Tnmd. Reviewer-facing table.",
+    digits = 1
+)
+```
+
+*Output:* a long-format TSV plus a wide table for the reviewer reply.
+Headline metric: in each dataset, identify the cluster with the highest
+`pct_expressing` for Tigd4 and check that the same cluster has the
+highest Col22a1 % AND that Pdgfra/Tnmd clusters have low Tigd4 %.
+
+## Reviewer headline (auto-filled from the summary above)
+
+```{r}
+top_cluster = summary_long %>%
+    filter(gene == "Tigd4") %>%
+    group_by(dataset) %>%
+    arrange(desc(pct_expressing)) %>%
+    dplyr::slice(1) %>%
+    ungroup()
+
+knitr::kable(top_cluster,
+             caption = "Cluster with the highest % of Tigd4-expressing cells per dataset.")
+```
+
+## Cluster characterisation & cross-dataset MTJ comparison `(canvas: 008)`
+
+Petrany and Kim were clustered de-novo; the **MTJ** cluster is resolved by the highest
+Col22a1⁺ fraction (expected Petrany 26, Kim 17). Petrany cluster **16** is a second
+Col22a1⁺ population marked by high **Ankrd1** (NMJ/MTJ-adjacent).
+
+```{r cl_resolve}
+pet_mtj = top_marker_cluster(petrany, "Col22a1")
+kim_mtj = top_marker_cluster(kim,     "Col22a1")
+pet_ank = "16"   # the Ankrd1-high Col22a1+ comparison cluster (by number)
+if(!identical(pet_mtj, "26")) message("WARNING: Petrany Col22a1-top cluster is ", pet_mtj, " (expected 26)")
+if(!identical(kim_mtj, "17")) message("WARNING: Kim Col22a1-top cluster is ", kim_mtj, " (expected 17)")
+message("Petrany MTJ=", pet_mtj, " Ankrd1-cluster=", pet_ank, "; Kim MTJ=", kim_mtj)
+```
+
+### Figure 4 — Petrany cluster 16 (Ankrd1⁺) vs MTJ cluster 26 (mean expression)
+
+*Direct comparison of the two Col22a1⁺ Petrany clusters — each dot is a gene, axes are its
+mean expression in cluster 16 vs cluster 26; off-diagonal genes are what distinguish the MTJ
+cluster from its Ankrd1⁺ neighbour.*
+
+*Why this figure:* Q1 hinges on Tigd4 marking the bona fide MTJ cluster — since two
+Col22a1⁺ clusters exist in Petrany, this confirms the MTJ assignment (cluster 26) is
+correct and that Tigd4 tracks the MTJ cluster rather than the Ankrd1⁺ neighbour.
+
+```{r fig4_pet_16_vs_26, fig.width=5, fig.height=5}
+me  = cluster_mean_expr(petrany)
+cmp = data.frame(gene_name = rownames(me),
+                 c_ank = me[, pet_ank], c_mtj = me[, pet_mtj])
+lab = cmp %>% filter(gene_name %in% c("Col22a1","Tigd4","Ankrd1","Ckm","Myh4","Tnnt3"))
+top = cmp %>% mutate(d = c_mtj - c_ank) %>% arrange(desc(abs(d))) %>% head(15)
+g4 = ggplot(cmp, aes(c_ank, c_mtj)) +
+    geom_point(size = 0.4, color = "lightgray") +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_point(data = lab, color = "#E88C8C", size = 1.6) +
+    ggrepel::geom_text_repel(data = dplyr::distinct(dplyr::bind_rows(lab, top)),
+        aes(label = gene_name), size = 3, max.overlaps = 30) +
+    labs(x = sprintf("mean expr — Petrany cluster %s (Ankrd1+)", pet_ank),
+         y = sprintf("mean expr — Petrany cluster %s (MTJ)", pet_mtj)) +
+    globals$theme
+print(g4)
+ggsave(file.path(outpath, DateNamer("scatter_petrany_16_vs_26.pdf")), g4, width = 5, height = 5)
+```
+
+*Input:* per-cluster mean log-normalized expression (Petrany). *Method:* `cluster_mean_expr`;
+genes above the diagonal are higher in MTJ (26), below in the Ankrd1⁺ cluster (16).
+*Shows:* how the MTJ cluster differs from its Ankrd1⁺ neighbour — Col22a1 should be MTJ-high,
+Ankrd1 cluster-16-high.
+
+### Figure 5 — Cross-dataset MTJ concordance (Kim 17 vs Petrany 26)
+
+*Does the MTJ signature reproduce across two independent atlases? Each dot is a gene; x/y =
+its MTJ-cluster enrichment (log2FC vs rest) in Petrany 26 and Kim 17. Genes near the diagonal
+agree between datasets; the MTJ markers Col22a1/Tigd4 should sit in the concordant upper-right.*
+
+*Why this figure:* Q1 calls for evidence across multiple published datasets — showing that
+Tigd4's MTJ enrichment is concordant between two independent atlases demonstrates the
+specificity is reproducible and not a single-dataset artifact.
+
+```{r fig6_crossdataset, fig.width=5, fig.height=5}
+lfc_kim = cluster_vs_rest_lfc(kim,     kim_mtj) %>% dplyr::select(gene_name, kim = avg_log2FC, kim_pct = pct.1)
+lfc_pet = cluster_vs_rest_lfc(petrany, pet_mtj) %>% dplyr::select(gene_name, pet = avg_log2FC, pet_pct = pct.1)
+# Keep only genes detected (>10% of MTJ nuclei) in BOTH clusters — drops the axis-hugging
+# "lines of dots", which are genes seen in one atlas but absent in the other (FoldChange≈0).
+cross = inner_join(lfc_kim, lfc_pet, by = "gene_name") %>%
+    filter(kim_pct > 0.1, pet_pct > 0.1)
+rho   = suppressWarnings(cor(cross$kim, cross$pet, method = "spearman"))
+labc  = cross %>% filter(gene_name %in% c("Col22a1","Tigd4","Ckm"))
+g6 = ggplot(cross, aes(pet, kim)) +
+    geom_point(size = 0.4, alpha = 0.6, color = "lightgray") +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_point(data = labc, color = "#E88C8C", size = 1.6) +
+    ggrepel::geom_text_repel(data = labc, aes(label = gene_name), size = 3) +
+    labs(x = sprintf("Petrany cluster %s vs rest (log2FC)", pet_mtj),
+         y = sprintf("Kim cluster %s vs rest (log2FC)", kim_mtj),
+         title = sprintf("MTJ-vs-MTJ concordance — Spearman ρ = %.2f (n = %d)", rho, nrow(cross))) +
+    globals$theme
+print(g6)
+ggsave(file.path(outpath, DateNamer("scatter_crossdataset_MTJ_kim_vs_petrany.pdf")), g6, width = 5, height = 5)
+
+# export the ranked cross-dataset MTJ-concordance table (canvas 044): mean MTJ enrichment across
+# the two atlases, descending — the gene source for report 04's exercise-FC figure
+cross_out = cross %>%
+    mutate(mtj_mean = (kim + pet) / 2) %>%
+    arrange(desc(mtj_mean)) %>%
+    dplyr::select(gene_name, kim, pet, kim_pct, pet_pct, mtj_mean)
+write.table(cross_out,
+    file = file.path(outpath, DateNamer("table_crossdataset_MTJ_kim_vs_petrany.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* cluster-vs-rest log2FC for the MTJ cluster in each atlas (Kim 17, Petrany 26),
+restricted to genes detected in >10% of nuclei in **both** MTJ clusters (removes the
+one-atlas detection artifact). *Method:* depth-normalized LFC; ρ = Spearman (dashed y=x
+reference). *Shows:* whether the MTJ enrichment signature reproduces across atlases —
+Col22a1/Tigd4 should sit in the concordant (upper-right) corner.
+
+### Dataset descriptions & processing parameters
+
+```{r dataset_table}
+ds = tibble::tibble(
+    dataset    = c("Kim/Birchmeier 2020", "Petrany 2020", "De Micheli 2020"),
+    accession  = c("E-MTAB-8623", "GSE147127", "GSE143437"),
+    tissue     = c("mouse hindlimb muscle (snRNA)", "mouse TA (snRNA, lifespan)", "mouse regenerating muscle (snRNA/scRNA)"),
+    assembly   = c("mm10", "mm10", "mm10"),
+    n_nuclei   = c(ncol(kim), ncol(petrany), ncol(demich)),
+    n_clusters = c(nlevels(kim$seurat_clusters), nlevels(petrany$seurat_clusters),
+                   if("seurat_clusters" %in% colnames(demich@meta.data)) nlevels(factor(demich$seurat_clusters)) else NA_integer_))
+knitr::kable(ds, caption = "Published mouse-muscle snRNA-seq atlases used in report 05.")
+```
+
+**Processing (read from `Scripts/Bin/snRNA_Loaders.R`):**
+
+- **Kim/Birchmeier** — object is Ensembl-ID indexed; mapped ENSMUSG→SYMBOL (org.Mm.eg.db,
+  unique), RNA assay rebuilt on symbols, then clustered de-novo: `NormalizeData` →
+  `FindVariableFeatures(3000)` → `ScaleData` → `RunPCA` → `FindNeighbors(dims=1:30)` →
+  `FindClusters(res=0.6)` → `RunUMAP(dims=1:30)`.
+- **Petrany** — CellRanger `filtered_feature_bc_matrix.h5` (Synapse syn21676145, 5 TA
+  samples); QC `nFeature 200–7000`, `percent.mt < 10`; `merge` → `JoinLayers` → same
+  clustering recipe (3000 HVG, dims 1:30, res 0.6).
+- **De Micheli** — author raw counts + metadata; `NormalizeData` only (author cell
+  annotations retained).
+- Integration is at the **gene-symbol** level (mm10 atlases ↔ mm39 project); no liftOver
+  (symbol overlap > ~95%).
+
+## Figure 6 — Tigd4 in MTJ vs tenocytes (iScience 2021 / GSE162307) `(canvas: 027)`
+
+*Why this figure:* the direct MTJ-vs-tenocyte test for reviewer Q1. The iScience 2021 atlas is the
+one dataset here that contains **both** an MTJ (Col22a1⁺) and a tenocyte (Tnmd/Scx/Mkx⁺) cluster,
+so plotting per-gene mean expression in the tenocyte cluster (x) against the MTJ cluster (y) shows
+whether Tigd4 — like Col22a1 — is enriched in the MTJ relative to the tendon compartment.
+
+```{r fig6_iscience_teno_mtj, fig.width=6, fig.height=6}
+s = iscience
+mtj_cl    = top_marker_cluster(s, "Col22a1")
+teno_tops = sapply(intersect(c("Tnmd","Scx","Mkx"), rownames(s)),
+                   function(g) top_marker_cluster(s, g))
+teno_cl   = names(sort(table(teno_tops), decreasing = TRUE))[1]   # majority across tenocyte markers
+message("iScience MTJ cluster (Col22a1): ", mtj_cl, "  |  tenocyte cluster: ", teno_cl)
+
+cme = cluster_mean_expr(s, group_col = "seurat_clusters")   # genes x clusters, mean log-norm
+stopifnot(all(c(as.character(mtj_cl), as.character(teno_cl)) %in% colnames(cme)))
+
+df  = data.frame(gene = rownames(cme),
+                 teno = cme[, as.character(teno_cl)],
+                 mtj  = cme[, as.character(mtj_cl)])
+lab = df[df$gene %in% c("Col22a1","Tigd4"), ]
+
+g = ggplot(df, aes(teno, mtj)) +
+    geom_point(color = "lightgray", size = 0.4) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_point(data = lab, color = "#E88C8C", size = 2.2) +
+    ggrepel::geom_text_repel(data = lab, aes(label = gene), size = 3.2,
+                             min.segment.length = 0, box.padding = 0.6) +
+    labs(x = paste0("mean log-norm expr — tenocyte (cluster ", teno_cl, ")"),
+         y = paste0("mean log-norm expr — MTJ (cluster ", mtj_cl, ")")) +
+    globals$theme
+print(g)
+ggsave(file.path(outpath, DateNamer("scatter_iscience_tenocyte_vs_MTJ.pdf")), g, width = 6, height = 6)
+
+ctrl = cme[intersect(c("Col22a1","Tigd4","Tnmd","Scx","Mkx"), rownames(cme)),
+           c(as.character(mtj_cl), as.character(teno_cl)), drop = FALSE]
+colnames(ctrl) = c(paste0("MTJ_cl", mtj_cl), paste0("teno_cl", teno_cl))
+knitr::kable(round(ctrl, 3),
+    caption = "iScience marker mean log-norm expression — MTJ vs tenocyte cluster. Controls: Col22a1/Tigd4 MTJ-high; Tnmd/Scx/Mkx tenocyte-high.")
+write.table(data.frame(gene = rownames(ctrl), ctrl, check.names = FALSE),
+    file = file.path(outpath, DateNamer("table_iscience_tenocyte_vs_MTJ_markers.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* the iScience 2021 mouse atlas (`load_iscience_2021()`, GSE162307; 5 samples merged,
+re-clustered). MTJ = top-Col22a1 cluster; tenocyte = the cluster topping Tnmd/Scx/Mkx
+(`top_marker_cluster`, majority vote).
+*Method:* per-gene mean log-norm expression (`cluster_mean_expr`) in the tenocyte cluster (x) vs
+the MTJ cluster (y); y=x diagonal; Col22a1 and Tigd4 highlighted + labelled. Marker control table
+exported.
+*Shows:* Col22a1 and **Tigd4** sit above the diagonal (MTJ > tenocyte) — Tigd4 marks the MTJ, not
+the tendon compartment — while Tnmd/Scx/Mkx fall below (tenocyte-high), validating the two cluster
+identities.
+
+## Session info
+
+```{r}
+sessionInfo()
+```

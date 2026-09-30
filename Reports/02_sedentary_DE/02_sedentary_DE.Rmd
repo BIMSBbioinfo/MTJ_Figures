@@ -1,0 +1,1172 @@
+---
+title: "02 — Translatome vs transcriptome specificity (MTJ vs CK8)"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Reviewer question — Q6.** Provide a heatmap / gene list of genes specific to the
+> translatome versus the transcriptome, and compare this dataset to previously published
+> transcriptomes of the MTJ.
+>
+> **Purpose.** This report delivers the translation-vs-transcription-specific gene
+> heatmap and exported gene list via DESeq2 translation efficiency (MTJ vs CK8), and
+> benchmarks the resulting MTJ-translation-specific set against the published
+> Kim/Birchmeier MTJ transcriptome the reviewer asked us to compare to.
+
+<!--
+# Canvas: Prompts/canvases/002_sedentary-de.md
+Reviewer comment (Prompts/comments.md:30-35): provide (a) a heatmap / gene list of
+genes specific to the translatome vs the transcriptome, and (b) a comparison to a
+previously published MTJ transcriptome.
+
+Translation efficiency per cell type = Ribo / RNA on DESeq2 size-factor-normalized
+counts (NOT RPKM, NOT the whole-tissue Input fraction). Differential-TE significance =
+the assay:condition interaction. Published reference = Kim/Birchmeier 2020 MTJ cluster.
+
+Upstream:
+  Documentation/sample_sheet.tsv                 (via load_salmon_counts)
+  Scripts/Bin/Translation_Efficiency.R           (build_ribo_rna_TE, translation_efficiency_deseq2)
+  Scripts/Bin/snRNA_Loaders.R                    (kim_mtj_signature, load_kim_birchmeier_2020)
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(ggrepel)
+    library(DESeq2)
+    library(ComplexHeatmap)
+    library(circlize)
+})
+source.lib("ScanLib.R")
+source.lib("Bacon.R")
+source.lib("Read_Annotation.R")
+source.pro("Sample_Sheet.R")
+source.pro("Translation_Efficiency.R")
+source.pro("snRNA_Loaders.R")
+source.pro("Differential_Expression.R")   # cached single-modality DE (Fig 2 patterns + supplementary)
+source.pro("DE_Reporting.R")              # classify_DE for the Ribo/RNA pattern calls
+
+report_name = "02_sedentary_DE"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+
+path_gtf = "/data/local/vfranke/Annotation/mm39/EnsemblGenes/Mus_musculus.GRCm39.113.chr.gtf"
+annot    = read_Gene_Annotation(path_gtf)
+
+# Controls — both sets expected CONCORDANT (near-diagonal, delta_TE ~ 0, ns):
+#  - transcriptional MTJ markers: TE divides transcription out, so genes whose MTJ
+#    enrichment is transcriptional (high in both Ribo and RNA) must NOT show differential
+#    translation efficiency. If they swing strongly off-diagonal, suspect a normalization
+#    artifact rather than biology.
+#  - housekeeping: no cell-type difference in translation efficiency.
+gset         = c("Tigd4","Col22a1","Ccn2","Klf5")   # transcriptional MTJ markers (Ccn2 = Ctgf in mm39)
+housekeeping = c("Actb","Gapdh","Rplp0","Rpl13a","Rps18","Tbp")
+# Translation-specific POSITIVE control — preferentially ribosome-loaded in MTJ
+# (high Ribo / low RNA in MTJ, the reverse in CK8): must land clearly above the diagonal.
+pos_control  = c("Klf2")
+```
+
+## Translation efficiency dataset
+
+```{r build_te}
+ss = load_sample_sheet()
+TE = build_ribo_rna_TE(ss, path_gtf = path_gtf)
+
+te = TE$te %>%
+    left_join(dplyr::select(annot, gene_id, gene_name, gene_biotype), by = "gene_id")
+
+n_sig = te %>% dplyr::count(te_class)
+knitr::kable(n_sig, caption = "Genes per translation-efficiency class. MTJ/CK8 = significant differential TE; ns_or_concordant = no significant TE difference.")
+```
+
+*Input:* cell-type-matched ribosome-bound (HA-Rpl22 pulldown) and total-RNA (bulk
+Tigd4/CK8) Salmon gene counts, assembled by `build_ribo_rna_TE()`.
+*Method:* one joint `DESeqDataSet` over all Ribo + RNA samples; `estimateSizeFactors`
+(median-of-ratios across the combined matrix); per cell type
+TE = mean(normalized Ribo) / mean(normalized RNA). Differential-TE significance from the
+`~ assay + condition + assay:condition` interaction (`translation_efficiency_deseq2`),
+direction from the log2-TE delta. Thresholds `|Δlog2TE| > 0.75` & interaction `padj < 0.05`.
+The whole-tissue Input fraction is deliberately excluded (non-myofiber cells).
+**Non-coding genes (Gm*/predicted/non-coding biotypes) are dropped before the interaction test**
+(`protein_coding_only = TRUE`), so dispersion estimation and BH correction consider only
+protein-coding genes.
+
+## Analyzed samples per group `(canvas: 066)`
+
+*Number of samples that entered each differential-expression contrast, from the DE colData: sedentary
+Ribo-Tag and bulk RNA from the joint TE model (`TE$cdata`), exercise Ribo-Tag from
+`Differential_Expression_Exercise()`. Ribo-Tag counts are the HA-Rpl22 **pulldown** fraction only (Input
+excluded).*
+
+```{r sample_counts}
+suppressPackageStartupMessages(library(DESeq2))
+exe    = Differential_Expression_Exercise()
+n_exe  = table(as.data.frame(colData(exe$dds))$Factor)          # CK8_HA / MTJ_HA / *_Input
+sed    = table(condition = TE$cdata$condition, assay = TE$cdata$assay)
+
+sample_counts = rbind(
+    data.frame(assay = "Ribo-Tag (sedentary)", cell = "MTJ", n = sed["MTJ","ribo"]),
+    data.frame(assay = "Ribo-Tag (sedentary)", cell = "CK8", n = sed["CK8","ribo"]),
+    data.frame(assay = "Ribo-Tag (exercise)",  cell = "MTJ", n = as.integer(n_exe["MTJ_HA"])),
+    data.frame(assay = "Ribo-Tag (exercise)",  cell = "CK8", n = as.integer(n_exe["CK8_HA"])),
+    data.frame(assay = "bulk RNA",             cell = "MTJ", n = sed["MTJ","rna"]),
+    data.frame(assay = "bulk RNA",             cell = "CK8", n = sed["CK8","rna"]))
+knitr::kable(sample_counts, row.names = FALSE,
+    caption = "Analyzed samples per group (DE colData). Ribo-Tag = HA-Rpl22 pulldown (Input excluded); bulk RNA = Tigd4(MTJ)/CK8, with Tigd4_br2 excluded upstream on QC (→ MTJ n=3). (canvas 066)")
+write.table(sample_counts, file = file.path(outpath, DateNamer("table_analyzed_sample_counts.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+# oracle: 6 rows, all groups non-empty; the joint TE model uses matched ribo/rna composition (3/4 each)
+stopifnot(nrow(sample_counts) == 6, all(sample_counts$n >= 1),
+          all(sed[c("MTJ","CK8"),"ribo"] == sed[c("MTJ","CK8"),"rna"]))
+```
+
+## Figure 0 — Sequencing depth (reads per library), Ribo-seq & RNA-seq `(canvas: 075)`
+
+*Why this figure:* a QC view of library size per sample — total assigned gene counts for each Ribo-Tag
+(sedentary pulldown) and bulk-RNA library, so depth imbalances (which drive size-factor variation and RNA
+noise) are visible.
+
+```{r fig0_library_sizes, fig.width=9, fig.height=5.5}
+libsize = data.frame(TE$cdata, reads = colSums(DESeq2::counts(TE$dds))) %>%
+    mutate(assay     = factor(assay, c("ribo","rna"), c("Ribo-seq (Ribo-Tag)", "RNA-seq (bulk)")),
+           condition = factor(condition, c("MTJ","CK8")),
+           sample    = factor(sample, levels = sample[order(assay, condition, reads)]))
+g_lib = ggplot(libsize, aes(sample, reads / 1e6, fill = condition)) +
+    geom_col() +
+    scale_fill_manual(values = c(MTJ = "#E88C8C", CK8 = "gray50"), name = NULL) +
+    facet_wrap(~ assay, scales = "free_x") +
+    labs(x = NULL, y = "assigned gene counts (millions)") +
+    globals$theme +
+    theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 7),
+          axis.title.y = element_text(margin = margin(r = 8)),
+          plot.margin  = margin(t = 6, r = 10, b = 24, l = 14))
+print(g_lib)
+ggsave(file.path(outpath, DateNamer("barplot_library_size_ribo_rna.pdf")), g_lib, width = 9, height = 5.5)
+write.table(libsize %>% dplyr::select(sample, assay, condition, reads),
+            file = file.path(outpath, DateNamer("table_library_size_ribo_rna.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+# oracle: one bar per analyzed library (7 ribo + 7 rna), all positive
+stopifnot(nrow(libsize) == ncol(TE$dds), all(libsize$reads > 0))
+```
+
+*Input:* per-sample total assigned gene counts (`colSums` of the raw count matrix in the joint TE model
+`TE$dds`) — Ribo-Tag sedentary pulldown (MTJ 3 / CK8 4) and bulk RNA (Tigd4/CK8). *Method:* bar of total
+counts (millions) per library, colored by cell type, faceted by assay. *Shows:* the sequencing depth of each
+library; the bulk-RNA libraries vary ~3× in depth (the source of the size-factor spread noted in the RNA
+variance diagnostics). PDF `barplot_library_size_ribo_rna.pdf`, table `table_library_size_ribo_rna.tsv`.
+
+## Ribo/RNA single-modality patterns + published MTJ signatures `(canvas: 016)`
+
+```{r build_patterns}
+# single-modality DE: the raw Ribo MTJ/CK8 and RNA Tigd4/CK8 contrasts (not carried in `te`)
+ribo = Riboseq_Differential_Expression()
+rna  = RNAseq_Differential_Expression()
+ribo_contrast = "MTJ_HA.Rpl22_CK8_HA.Rpl22"
+rna_contrast  = "Tigd4_CK8"
+
+ribo_de = ribo$res %>% dplyr::rename(gene_id = id) %>% classify_DE(ribo_contrast) %>%
+    dplyr::transmute(gene_id,
+                     ribo_lfc  = .data[[paste0("log2FoldChange.", ribo_contrast)]],
+                     ribo_diff = .data[[paste0("diff.", ribo_contrast)]])
+rna_de  = rna$res %>% dplyr::rename(gene_id = id) %>% classify_DE(rna_contrast) %>%
+    dplyr::transmute(gene_id,
+                     rna_lfc  = .data[[paste0("log2FoldChange.", rna_contrast)]],
+                     rna_diff = .data[[paste0("diff.", rna_contrast)]])
+
+# published MTJ signatures (same method, two atlases)
+kim_sig     = kim_mtj_signature()
+petrany_sig = petrany_mtj_signature()
+
+# gene table: TE + both single-modality LFC/diff calls, protein-coding
+ptab = te %>%
+    inner_join(ribo_de, by = "gene_id") %>%
+    inner_join(rna_de,  by = "gene_id") %>%
+    filter(gene_biotype == "protein_coding") %>%
+    mutate(in_kim     = gene_name %in% kim_sig$gene_name,
+           in_petrany = gene_name %in% petrany_sig$gene_name)
+```
+
+*Input:* the joint-TE table (`te`) plus the cached single-modality DE — Ribo MTJ/CK8
+(`MTJ_HA.Rpl22_CK8_HA.Rpl22`) and bulk RNA Tigd4/CK8 — classified at the project default cut.
+*Method:* `classify_DE()` assigns Up/Down/No per modality; the two LFCs are joined onto `te`.
+`kim_mtj_signature()` / `petrany_mtj_signature()` build the published MTJ marker sets (each =
+the highest-Col22a1⁺ cluster's `FindMarkers` positive markers, top-200 by avg_log2FC).
+
+## Figure 1 — Translation-efficiency scatter (MTJ vs CK8) `(canvas: 002)`
+
+*Why this figure:* establishes the gene-by-gene basis for the reviewer's
+translatome-vs-transcriptome distinction — it separates genes regulated at the
+translational level (off-diagonal) from those whose MTJ enrichment is purely
+transcriptional (on-diagonal), so the specific gene set in Figures 2–3 has a defined,
+auditable origin.
+
+```{r fig1_te_scatter, fig.width=5.5, fig.height=5}
+plot_df = te %>% filter(detectable)
+# label: controls + the strongest differential-TE genes in each direction
+top_mtj = plot_df %>% filter(te_class == "translation_specific_MTJ") %>%
+    arrange(desc(delta_TE)) %>% head(10)
+top_ck8 = plot_df %>% filter(te_class == "translation_specific_CK8") %>%
+    arrange(delta_TE) %>% head(10)
+lab_df  = dplyr::distinct(dplyr::bind_rows(
+    plot_df %>% filter(gene_name %in% c(gset, pos_control)), top_mtj, top_ck8))
+
+g1 = ggplot(plot_df, aes(log2TE_CK8, log2TE_MTJ)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(plot_df, te_class == "translation_specific_MTJ"),
+               color = "#E88C8C", size = 0.6) +
+    geom_point(data = dplyr::filter(plot_df, te_class == "translation_specific_CK8"),
+               color = "#8CC6E8", size = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    # positive control (Klf2) highlighted as a green diamond — expected above the diagonal
+    geom_point(data = dplyr::filter(plot_df, gene_name %in% pos_control),
+               color = "#2CA02C", size = 2.5, shape = 18) +
+    geom_text_repel(data = lab_df, aes(label = gene_name), size = 3, color = "black",
+                    min.segment.length = 0, max.overlaps = 30) +
+    labs(x = "log2 TE  CK8  (Ribo / RNA)",
+         y = "log2 TE  MTJ  (Ribo / RNA)") +
+    globals$theme
+print(g1)
+ggsave(file.path(outpath, DateNamer("scatter_TE_MTJ_vs_CK8.pdf")), g1, width = 5.5, height = 5)
+```
+
+*Input:* per-gene log2 TE for MTJ (y) and CK8 (x), detectable genes only.
+*Method:* DESeq2 size-factor-normalized Ribo/RNA ratio per cell type. Red = significantly
+higher TE in MTJ (translation-specific-MTJ), blue = higher in CK8; gray = no significant
+difference. Dashed line is y = x (equal TE).
+*Labels:* the top-10 differential-TE genes in each direction (by `delta_TE`) plus the
+controls.
+*Shows:* genes off the diagonal are translationally regulated in a cell-type-specific way
+that is *not* explained by transcript abundance. **Klf2** (green diamond) is the
+translation-specific positive control — preferentially ribosome-loaded in MTJ — and sits
+clearly **above** the diagonal as expected. The other labelled genes are *transcriptional*
+MTJ markers (`gset`); because TE divides transcription out they are expected **on** the
+diagonal (concordant), confirming the analysis isolates translation rather than
+re-deriving the transcriptional MTJ signature.
+
+## Figure 1b — Differential-TE volcano (Ribo / bulk RNA, MTJ vs CK8) `(canvas: 067)`
+
+*Why this figure:* the volcano companion to Figure 1 — same joint-model differential translation
+efficiency, but plotting effect size against significance so the reviewer can see how many genes clear
+the `int_padj < 0.05` gate and in which direction the ribosome loading shifts once transcription is
+divided out.
+
+```{r fig1b_bulk_te_volcano, fig.width=6, fig.height=5}
+vol_te     = te %>% filter(detectable)
+test_genes = c("Klf2", "Klf5", "Tigd4", "Col22a1", "Cpne2", "Arhgap27")
+# top-10 differential-TE genes in each direction (by delta_TE within each significant class)
+top_up   = vol_te %>% filter(te_class == "translation_specific_MTJ") %>%
+    arrange(desc(delta_TE)) %>% head(10)
+top_down = vol_te %>% filter(te_class == "translation_specific_CK8") %>%
+    arrange(delta_TE) %>% head(10)
+# top-5 upregulated (highest positive delta_TE) transcription factors — GO:0003700
+# (DNA-binding transcription factor activity), highlighted in gold
+suppressPackageStartupMessages({ library(org.Mm.eg.db); library(AnnotationDbi) })
+tf_set = unique(na.omit(AnnotationDbi::select(org.Mm.eg.db, keys = "GO:0003700",
+              keytype = "GO", columns = "SYMBOL")$SYMBOL))
+top_tf = vol_te %>% filter(gene_name %in% tf_set, delta_TE > 0) %>%
+    arrange(desc(delta_TE)) %>% head(5)
+lab_test = vol_te %>% filter(gene_name %in% test_genes)
+lab_te   = dplyr::distinct(dplyr::bind_rows(lab_test, top_up, top_down, top_tf))
+
+g1b = ggplot(vol_te, aes(delta_TE, -log10(int_padj))) +
+    geom_vline(xintercept = c(-0.75, 0.75), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05),   linetype = 2, linewidth = 0.25) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(vol_te, te_class == "translation_specific_MTJ"),
+               color = "#E88C8C", size = 0.6) +
+    geom_point(data = dplyr::filter(vol_te, te_class == "translation_specific_CK8"),
+               color = "#8CC6E8", size = 0.6) +
+    geom_point(data = lab_test, color = "black", size = 1.6) +
+    geom_point(data = top_tf, color = "#DAA520", size = 2) +   # top-5 upregulated TFs, gold
+    geom_text_repel(data = lab_te, aes(label = gene_name), size = 2.6, color = "black",
+                    min.segment.length = 0, max.overlaps = 30) +
+    labs(x = "delta log2 TE  (MTJ - CK8,  Ribo / bulk RNA)",
+         y = "-log10 interaction padj") + globals$theme
+print(g1b)
+ggsave(file.path(outpath, DateNamer("volcano_bulk_TE_MTJ_vs_CK8.pdf")), g1b, width = 6, height = 5)
+
+# export the MTJ-up (translation-specific) genes from this volcano (FDR-significant) (canvas 074)
+write.table(vol_te %>% filter(te_class == "translation_specific_MTJ") %>%
+            dplyr::select(gene_id, gene_name, delta_TE, int_pvalue, int_padj, log2TE_MTJ, log2TE_CK8) %>%
+            arrange(desc(delta_TE)),
+            file = file.path(outpath, DateNamer("table_up_F1b_bulkTE_MTJ.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# oracle: Klf2 on the MTJ (positive delta_TE) side; 5 up-TFs, all positive delta_TE
+stopifnot(lab_te$delta_TE[lab_te$gene_name == "Klf2"] > 0,
+          nrow(top_tf) == 5, all(top_tf$delta_TE > 0))
+message("top-5 up-TFs: ", paste(top_tf$gene_name, collapse = ", "))
+```
+
+*Input:* per-gene bulk-RNA-normalized translation efficiency from the joint DESeq2 model (`te`,
+detectable **protein-coding** genes — non-coding/Gm biotypes were removed before the interaction test).
+*Method:* `x = delta_TE` (= `log2TE_MTJ − log2TE_CK8`, the `assay:condition`
+interaction log2FC), `y = -log10(int_padj)` (interaction BH-adjusted p). Red = significantly higher TE
+in MTJ (`translation_specific_MTJ`), blue = higher in CK8; gray = ns. Dashed guides mark the
+`|delta_TE| > 0.75` & `int_padj < 0.05` gates that define the `te_class` calls. *Labels:* the top-10
+differential-TE genes in each direction (by `delta_TE`: higher-TE-in-MTJ and higher-TE-in-CK8), the
+six labelled markers (Klf2/Klf5/Tigd4/Col22a1/Cpne2/Arhgap27, black points — Cpne2/Arhgap27 are the snRNA
+markers, both ns here), and the **top-5 up-regulated transcription factors** (highest positive `delta_TE`;
+GO:0003700 DNA-binding TF activity) marked with **gold** points.
+*Shows:* which genes are translationally (not transcriptionally) regulated between
+MTJ and CK8. **Klf2** (translation-specific positive control) sits on the positive-`delta_TE` MTJ side;
+**Tigd4** and **Col22a1** are transcriptional MTJ markers and fall near `delta_TE ≈ 0` because TE
+divides transcription out — the same concordance seen on Figure 1's diagonal.
+
+## Figure 1b′ — Same volcano on the *raw* interaction p-value `(canvas: 067)`
+
+*Why this figure:* the Figure 1b y-axis (BH-adjusted `int_padj`) is a genome-wide FDR that, at n=3–4,
+pushes strong per-gene signals below the line (e.g. Klf2: raw interaction p≈0.005 but `padj`≈0.13, because
+~800 genes share a similar raw p). This companion plots the **unadjusted** interaction p so the reviewer can
+see the per-gene evidence before the multiple-testing penalty. It is NOT a significance call — the FDR
+version (Figure 1b) governs which genes we report as significant.
+
+```{r fig1b_raw_volcano, fig.width=6, fig.height=5}
+# reuses vol_te / top_up / top_down / top_tf / lab_test / lab_te from the fig1b chunk
+# colour by RAW-p significance (int_pvalue<0.05 past the |delta_TE|>0.75 gate), by direction —
+# a superset of Fig 1b's FDR-significant (te_class) points
+vol_raw = vol_te %>% mutate(raw_class = dplyr::case_when(
+    int_pvalue < 0.05 & delta_TE >  0.75 ~ "MTJ",
+    int_pvalue < 0.05 & delta_TE < -0.75 ~ "CK8",
+    TRUE                                 ~ "ns"))
+
+g1b_raw = ggplot(vol_raw, aes(delta_TE, -log10(int_pvalue))) +
+    geom_vline(xintercept = c(-0.75, 0.75), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05),   linetype = 2, linewidth = 0.25) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(vol_raw, raw_class == "MTJ"), color = "#E88C8C", size = 0.6) +
+    geom_point(data = dplyr::filter(vol_raw, raw_class == "CK8"), color = "#8CC6E8", size = 0.6) +
+    geom_point(data = lab_test, color = "black", size = 1.6) +
+    geom_point(data = top_tf, color = "#DAA520", size = 2) +
+    geom_text_repel(data = lab_te, aes(label = gene_name), size = 2.6, color = "black",
+                    min.segment.length = 0, max.overlaps = 30) +
+    labs(x = "delta log2 TE  (MTJ - CK8,  Ribo / bulk RNA)",
+         y = "-log10 interaction p-value (raw)") + globals$theme
+print(g1b_raw)
+ggsave(file.path(outpath, DateNamer("volcano_bulk_TE_MTJ_vs_CK8_rawp.pdf")), g1b_raw, width = 6, height = 5)
+
+# export the MTJ-up genes from the RAW-p volcano (int_pvalue<0.05 & delta_TE>0.75) (canvas 074)
+write.table(vol_raw %>% filter(raw_class == "MTJ") %>%
+            dplyr::select(gene_id, gene_name, delta_TE, int_pvalue, int_padj) %>%
+            arrange(desc(delta_TE)),
+            file = file.path(outpath, DateNamer("table_up_F1b_raw_bulkTE_MTJ.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# oracle: Klf2 clears the raw p<0.05 line (match by gene_id — gene_name has NAs);
+# raw-p-significant set is a superset of the FDR-significant (te_class) set
+stopifnot(vol_raw$int_pvalue[vol_raw$gene_id == "ENSMUSG00000055148"] < 0.05,
+          sum(vol_raw$raw_class != "ns") >= sum(vol_te$te_class != "ns_or_concordant"))
+```
+
+*Input/Method:* identical to Figure 1b except `y = -log10(int_pvalue)` — the **unadjusted** `assay:condition`
+interaction p-value (no BH correction). Here points are coloured by **raw-p significance**: red = `int_pvalue
+< 0.05` & `delta_TE > 0.75` (higher TE in MTJ), blue = `int_pvalue < 0.05` & `delta_TE < −0.75` (higher in
+CK8), gray = ns — a **superset** of Figure 1b's FDR-coloured (`te_class`) points. Labels (top-10 each
+direction, six labelled markers in black incl. Cpne2/Arhgap27, top-5 up-TFs in gold) and the dashed
+`|delta_TE|=0.75` / `p=0.05` gates match Figure 1b. *Shows:* the per-gene translational evidence before multiple-testing correction — many more
+genes clear the nominal `p=0.05` line than survive FDR. **Klf2** now sits above the `p=0.05` line (raw
+p≈0.005), illustrating that its Figure-1b "ns" status is an FDR/power effect, not an absence of signal. Read
+significance from Figure 1b (FDR); read this figure only for per-gene effect strength.
+
+## Figure 1c — Klf2 per-sample expression, Ribo-seq vs RNA-seq `(canvas: 068)`
+
+*Why this figure:* zooms from the genome-wide volcano to the single gene the reviewer cares about — shows
+per replicate that Klf2's positive `delta_TE` comes from higher **ribosome loading** in MTJ while its
+**total-RNA** level is essentially flat, i.e. a translational (not transcriptional) effect.
+
+```{r fig1c_klf2_dotplot, fig.width=6, fig.height=4}
+klf2_id = "ENSMUSG00000055148"
+stopifnot(klf2_id %in% rownames(TE$dds))
+nc = DESeq2::counts(TE$dds, normalized = TRUE)[klf2_id, ]
+kdf = data.frame(TE$cdata, expr = nc) %>%
+    mutate(assay     = factor(assay, c("ribo","rna"), c("Ribo-seq", "RNA-seq")),
+           condition = factor(condition, c("MTJ","CK8")))
+
+g1c = ggplot(kdf, aes(condition, expr, color = condition)) +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.5, linewidth = 0.3, color = "gray40") +
+    geom_point(position = position_jitter(width = 0.12, height = 0), size = 2, alpha = 0.9) +
+    scale_color_manual(values = c(MTJ = "#E88C8C", CK8 = "gray50"), guide = "none") +
+    facet_wrap(~ assay, scales = "free_y") +
+    labs(x = NULL, y = "normalized expression (Klf2)") + globals$theme
+print(g1c)
+ggsave(file.path(outpath, DateNamer("dotplot_Klf2_expression_ribo_rna.pdf")), g1c, width = 6, height = 4)
+
+# oracle: Ribo higher in MTJ (translational up); RNA ~flat (not a transcriptional increase)
+km = kdf %>% group_by(assay, condition) %>% summarize(m = mean(expr), .groups = "drop")
+stopifnot(km$m[km$assay=="Ribo-seq" & km$condition=="MTJ"] >
+          km$m[km$assay=="Ribo-seq" & km$condition=="CK8"])
+```
+
+*Input:* Klf2 (`ENSMUSG00000055148`) size-factor-normalized counts from the joint TE model (`TE$dds`), one
+point per sample; grouping from `TE$cdata` (`assay`, `condition`). *Method:* per-sample dot plot, condition
+(MTJ, CK8) on x, normalized expression on y, jittered points + gray mean crossbar, faceted by modality with
+a **free y-axis per panel** (Ribo and RNA are on different count scales). *Shows:* Klf2 ribosome occupancy
+(Ribo-seq) is clearly higher in MTJ than CK8, while its total-RNA level (RNA-seq) is essentially flat —
+the single-sample basis for Klf2's positive differential TE. Sample counts per panel match the analyzed-
+sample table (Ribo MTJ 3/CK8 4; RNA MTJ 3/CK8 4). PDF `dotplot_Klf2_expression_ribo_rna.pdf`.
+
+## Figure 1d — Cpne2 per-sample expression, Ribo-seq vs RNA-seq `(canvas: 069, 070, 072)`
+
+*Why this figure:* the same per-sample dot-plot as Figure 1c (Klf2), for the snRNA marker Cpne2 — bulk
+MTJ-vs-CK8 ribosome loading (Ribo-seq) and total RNA (RNA-seq) per replicate. Here the Ribo-seq and RNA-seq
+panels **share one y-axis** so the two modalities are directly comparable in magnitude for this gene.
+
+```{r fig1d_cpne2_dotplot, fig.width=6, fig.height=4}
+# per-gene marker dot plot in the Figure 1c style; shared_y=TRUE fixes one y-axis across Ribo/RNA
+marker_dotplot = function(gid, gname, shared_y){
+    stopifnot(gid %in% rownames(TE$dds))
+    d = data.frame(TE$cdata, expr = DESeq2::counts(TE$dds, normalized = TRUE)[gid, ]) %>%
+        mutate(assay     = factor(assay, c("ribo","rna"), c("Ribo-seq", "RNA-seq")),
+               condition = factor(condition, c("MTJ","CK8")))
+    ggplot(d, aes(condition, expr, color = condition)) +
+        stat_summary(fun = mean, geom = "crossbar", width = 0.5, linewidth = 0.3, color = "gray40") +
+        geom_point(position = position_jitter(width = 0.12, height = 0), size = 2, alpha = 0.9) +
+        scale_color_manual(values = c(MTJ = "#E88C8C", CK8 = "gray50"), guide = "none") +
+        facet_wrap(~ assay, scales = if(shared_y) "fixed" else "free_y") +
+        labs(x = NULL, y = sprintf("normalized expression (%s)", gname)) + globals$theme
+}
+g1d = marker_dotplot("ENSMUSG00000034361", "Cpne2", shared_y = TRUE)
+print(g1d)
+ggsave(file.path(outpath, DateNamer("dotplot_Cpne2_ribo_rna.pdf")), g1d, width = 6, height = 4)
+
+# oracle: shared y — the two facet panels have identical y-limits
+py = ggplot_build(g1d)$layout$panel_params
+stopifnot(length(py) == 2, isTRUE(all.equal(py[[1]]$y.range, py[[2]]$y.range)))
+```
+
+*Input:* Cpne2 (`ENSMUSG00000034361`) size-factor-normalized counts from the joint TE model (`TE$dds`), one
+point per sample; grouping from `TE$cdata`. *Method:* per-sample dot plot (Figure 1c style), condition on x,
+normalized expression on y, jittered points + gray mean crossbar, faceted by modality with a **shared
+y-axis** (`scales="fixed"`) so Ribo-seq and RNA-seq magnitudes are directly comparable. *Shows:* Cpne2's bulk
+Ribo-Tag vs bulk-RNA behaviour per replicate. PDF `dotplot_Cpne2_ribo_rna.pdf`.
+
+## Figure 1e — Arhgap27 per-sample expression, Ribo-seq vs RNA-seq `(canvas: 069, 070, 072)`
+
+*Why this figure:* the Figure 1c-style per-sample dot-plot for Arhgap27; here the Ribo-seq and RNA-seq panels
+keep an **independent (free) y-axis** each, since the two modalities sit on different count scales for this gene.
+
+```{r fig1e_arhgap27_dotplot, fig.width=6, fig.height=4}
+g1e = marker_dotplot("ENSMUSG00000034255", "Arhgap27", shared_y = FALSE)
+print(g1e)
+ggsave(file.path(outpath, DateNamer("dotplot_Arhgap27_ribo_rna.pdf")), g1e, width = 6, height = 4)
+```
+
+*Input:* Arhgap27 (`ENSMUSG00000034255`) size-factor-normalized counts from `TE$dds`; grouping from
+`TE$cdata`. *Method:* as Figure 1d but with a **free y-axis per panel** (`scales="free_y"`). *Shows:*
+Arhgap27's bulk Ribo-Tag vs bulk-RNA behaviour per replicate. PDF `dotplot_Arhgap27_ribo_rna.pdf`.
+
+## Ribo × RNA pattern data + helpers `(canvas: 060)`
+
+*Figure 2 (the sign-based four-pattern heatmap) was removed (canvas 060); the Ribo×RNA panels are now
+the two contingency heatmaps below (Figure 2b at |log2FC|>1, plus a |log2FC|>0.75 companion). This
+setup chunk keeps the shared marker list, the Ribo∪RNA pattern table export, and the contingency-panel
+helper.*
+
+```{r ribo_rna_setup, fig.width=7, fig.height=10}
+named = c("Klf2","Klf5","Tigd4","Col22a1")   # markers labelled in the contingency heatmaps below
+
+# translation-specific gene list (both TE classes) — exported deliverable
+sig = te %>% filter(te_class %in% c("translation_specific_MTJ","translation_specific_CK8")) %>%
+    arrange(te_class, desc(abs(delta_TE)))
+write.table(
+    sig %>% dplyr::select(gene_id, gene_name, gene_biotype, te_class,
+                          log2TE_MTJ, log2TE_CK8, delta_TE, int_padj, ribo_MTJ, rna_MTJ, ribo_CK8, rna_CK8),
+    file = file.path(outpath, DateNamer("table_translation_specific_genes.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+
+# Ribo∪RNA significant union + exported pattern table (read by the bioRxiv reconciliation + analyses)
+union_set = ptab %>% filter(ribo_diff != "No" | rna_diff != "No")
+write.table(
+    union_set %>% dplyr::select(gene_id, gene_name, ribo_lfc, rna_lfc,
+                                ribo_diff, rna_diff, delta_TE, int_padj, in_kim, in_petrany),
+    file = file.path(outpath, DateNamer("table_ribo_rna_patterns.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+stopifnot(nrow(union_set) >= 4)
+
+# Up/None/Down significance class at a magnitude threshold `thr`
+cls3 = function(diff, lfc, thr) factor(ifelse(diff != "No" & lfc >  thr, "Up",
+                                       ifelse(diff != "No" & lfc < -thr, "Down", "None")),
+                                       levels = c("Up","None","Down"))
+
+# 3-row contingency kable: row 1 = riboseq class, row 2 = the other modality class, row 3 = count,
+# one column per (riboseq, other) Up/None/Down combination.
+flat3_kable = function(ribo_cls, other_cls, other_name, cap){
+    g = expand.grid(riboseq = c("Up","None","Down"), other = c("Up","None","Down"),
+                    stringsAsFactors = FALSE)
+    g$count = mapply(function(a, b) sum(ribo_cls == a & other_cls == b), g$riboseq, g$other)
+    m = rbind(g$riboseq, g$other, g$count)
+    rownames(m) = c("riboseq", other_name, "count")
+    knitr::kable(m, caption = cap)
+}
+
+# Reusable Ribo×bulk-RNA contingency panel: 3-row table (riboseq/rnaseq/count per Up/None/Down combo) +
+# heatmap of the ribo-significant genes split into the six cells, labels rotated horizontal + line-separated.
+bulk_cell_levels = c("Ribo Up / RNA Up","Ribo Up / RNA None","Ribo Up / RNA Down",
+                     "Ribo Down / RNA Up","Ribo Down / RNA None","Ribo Down / RNA Down")
+ribo_rna_panel = function(thr, pdfname, tablename){
+    d  = ptab %>% mutate(ribo_cls = cls3(ribo_diff, ribo_lfc, thr),
+                         rna_cls  = cls3(rna_diff,  rna_lfc,  thr))
+    print(flat3_kable(d$ribo_cls, d$rna_cls, "rnaseq", sprintf(
+        "Ribo × bulk-RNA counts at |log2FC|>%.2g & padj<0.05 (per Up/None/Down combination). Translational targets = (riboseq Up, rnaseq None).", thr)))
+    ds = d %>% filter(ribo_cls != "None") %>%                    # ribo-significant genes only (2-row table)
+        mutate(pattern = factor(paste0("Ribo ", ribo_cls, " / RNA ", rna_cls),
+                                levels = bulk_cell_levels)) %>% droplevels() %>%
+        arrange(pattern, desc(abs(ribo_lfc) + abs(rna_lfc)))
+    # export the heatmap gene table (canvas 065)
+    write.table(ds %>% dplyr::select(gene_id, gene_name, ribo_cls, rna_cls, cell = pattern,
+                                     ribo_lfc, rna_lfc, in_kim, in_petrany),
+                file = file.path(outpath, DateNamer(tablename)), sep = "\t", quote = FALSE, row.names = FALSE)
+    m = ds %>% dplyr::transmute(Ribo_MTJ = log2(ribo_MTJ+1), RNA_MTJ = log2(rna_MTJ+1),
+                                Ribo_CK8 = log2(ribo_CK8+1), RNA_CK8 = log2(rna_CK8+1)) %>% as.matrix()
+    rownames(m) = make.unique(ds$gene_name); mz = t(scale(t(m)))
+    li = sort(unique(c(ds %>% mutate(.r = row_number()) %>% group_by(pattern) %>% slice_head(n = 5) %>% pull(.r),
+                       which(ds$gene_name %in% named))))
+    hh = Heatmap(mz, name = "z(log2 norm)", col = colorRamp2(c(-2,0,2), c("#8CC6E8","white","#E88C8C")),
+            row_split = ds$pattern, row_title_rot = 0, row_gap = unit(0,"mm"), border = TRUE,
+            cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE, show_row_dend = FALSE,
+            left_annotation = rowAnnotation(Kim = ds$in_kim, Petrany = ds$in_petrany,
+                col = list(Kim = c(`TRUE`="#444444",`FALSE`="white"), Petrany = c(`TRUE`="#E88C8C",`FALSE`="white"))),
+            right_annotation = rowAnnotation(mark = anno_mark(at = li, labels = rownames(m)[li],
+                labels_gp = grid::gpar(fontsize = 8))))
+    pdf(file.path(outpath, DateNamer(pdfname)), width = 7, height = 10); draw(hh); dev.off(); draw(hh)
+    invisible(ds)
+}
+```
+
+## Figure 2a — Ribo vs bulk-RNA fold-change scatter `(canvas: 063)`
+
+*Why this figure:* directly compares the translation (Ribo-Tag MTJ/CK8) and transcription (bulk RNA
+Tigd4/CK8) log2 fold-changes per gene, with **Tigd4, Klf2, Klf5, Col22a1** labelled. Concordant genes lie
+near the dashed y=x line; translation-specific genes lie off it.
+
+```{r fig2a_ribo_vs_rna_scatter, fig.width=5.5, fig.height=5}
+lab4 = ptab %>% filter(gene_name %in% named)
+g2a = ggplot(ptab, aes(rna_lfc, ribo_lfc)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = 0, linewidth = 0.2) + geom_vline(xintercept = 0, linewidth = 0.2) +
+    geom_point(aes(color = -log10(int_padj)), size = 0.6, alpha = 0.8) +
+    scale_color_gradient(name = "-log10 int padj\n(differential TE)",
+                         low = "white", high = "red", na.value = "lightgray") +
+    geom_point(data = lab4, color = "black", size = 1.6) +
+    geom_text_repel(data = lab4, aes(label = gene_name), color = "black", size = 3,
+                    min.segment.length = 0, max.overlaps = Inf) +
+    labs(x = "log2 RNA-seq  MTJ / CK8  (Tigd4 / CK8)",
+         y = "log2 Ribo-seq  MTJ / CK8  (Ribo-Tag)") +
+    globals$theme
+print(g2a)
+ggsave(file.path(outpath, DateNamer("scatter_ribo_vs_rna_MTJ_CK8.pdf")), g2a, width = 5.5, height = 5)
+```
+
+*Input:* `ptab` (Ribo∪RNA-DE union) — `ribo_lfc` (Ribo-Tag MTJ/CK8) on y, `rna_lfc` (bulk RNA Tigd4/CK8)
+on x. *Method:* scatter with a dashed y=x reference; points colored by `-log10(int_padj)` — the
+**differential-TE interaction p-value from the Figure 1b volcano** (white→red gradient, red = most
+significant; genes without an interaction p are gray). The four markers labelled with `geom_text_repel`. *Shows:* per-gene translation vs
+transcription fold-change — concordant genes on the diagonal, translation-specific genes off it; the color
+highlights that the off-diagonal genes are the ones with significant differential TE. PDF
+`scatter_ribo_vs_rna_MTJ_CK8.pdf`.
+
+## Figure 2b — Ribo × bulk-RNA contingency at |log2FC|>1 `(canvas: 037, 060)`
+
+*Why this figure:* each gene is classified **independently** as **Up / None / Down** in Ribo-Tag and in
+bulk RNA (`padj<0.05 & |log2FC|>1`). The 3-row table below (riboseq / rnaseq / count, one column per
+Up/None/Down combination) and the heatmap show where the genes fall; the **(riboseq Up, rnaseq None)**
+cell is the translational-target pool (ribosome up, RNA flat).
+
+```{r fig2b_strict_lfc1, fig.width=7, fig.height=10}
+ribo_rna_panel(thr = 1, pdfname = "heatmap_ribo_rna_patterns_lfc1.pdf",
+               tablename = "table_ribo_rna_patterns_lfc1.tsv")
+```
+
+*Classification:* `Up` = padj<0.05 & log2FC>1, `Down` = padj<0.05 & log2FC<−1, `None` otherwise, in each
+modality independently. The printed table has three rows (riboseq / rnaseq / count) with one column per
+Up/None/Down combination. The heatmap shows the ribo-significant genes split into the six cells, row
+z-scored over the four `log2(mean+1)` cell-type×assay columns, group labels horizontal + line-separated.
+*Shows:* the (Ribo Up, RNA None) translational-target block plus the co-regulated (Up/Up, Down/Down) and
+discordant cells. PDF `heatmap_ribo_rna_patterns_lfc1.pdf`.
+
+## Figure 2b′ — Ribo × bulk-RNA contingency at |log2FC|>0.75 `(canvas: 060)`
+
+*Why this figure:* the same contingency at the project-standard `|log2FC|>0.75` cut — a looser companion
+to Figure 2b (a superset of its genes), so weaker-but-significant regulation is included.
+
+```{r fig2bp_lfc075, fig.width=7, fig.height=10}
+ribo_rna_panel(thr = 0.75, pdfname = "heatmap_ribo_rna_patterns_lfc075.pdf",
+               tablename = "table_ribo_rna_patterns_lfc075.tsv")
+```
+
+*Method:* identical to Figure 2b but at `|log2FC|>0.75 & padj<0.05`. PDF
+`heatmap_ribo_rna_patterns_lfc075.pdf`.
+
+## Figure 2c — removed
+
+*The separate-variance differential-TE heatmap (canvases 047/052) was removed (canvas 061);
+`heatmap_te_separate_variance.pdf` / `table_te_separate_variance_compare.tsv` are no longer regenerated.*
+
+## Figure 3 — TE scatter labelled by Kim & Petrany published MTJ markers `(canvas: 016)`
+
+*Why this figure:* the reviewer asked to compare this translatome to previously published MTJ
+transcriptomes. Re-drawing the Fig 1 TE scatter and overlaying which genes are MTJ markers in
+Kim and/or Petrany shows directly whether the published-MTJ genes land where our translatome
+flags translation-specific MTJ regulation — external validation on the same axes as Fig 1.
+
+```{r fig3_kim_petrany_scatter, fig.width=6, fig.height=5.5}
+sdf = te %>% filter(detectable) %>%
+    mutate(mtj_membership = case_when(
+        gene_name %in% kim_sig$gene_name & gene_name %in% petrany_sig$gene_name ~ "both",
+        gene_name %in% kim_sig$gene_name     ~ "Kim only",
+        gene_name %in% petrany_sig$gene_name ~ "Petrany only",
+        TRUE                                 ~ "none"))
+
+# label the published-MTJ markers that our translatome calls translation-specific MTJ
+lab3 = sdf %>% filter(mtj_membership != "none", te_class == "translation_specific_MTJ")
+
+g3 = ggplot(sdf, aes(log2TE_CK8, log2TE_MTJ)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(sdf, mtj_membership != "none"),
+               aes(color = mtj_membership), size = 1.1) +
+    scale_color_manual(values = c("both" = "#9467BD", "Kim only" = "#444444",
+                                  "Petrany only" = "#E88C8C"),
+                       name = "published MTJ marker") +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab3, aes(label = gene_name), size = 2.8, color = "black",
+                    min.segment.length = 0, max.overlaps = 30) +
+    labs(x = "log2 TE  CK8 (Ribo / RNA)", y = "log2 TE  MTJ (Ribo / RNA)") +
+    globals$theme
+print(g3)
+ggsave(file.path(outpath, DateNamer("scatter_TE_kim_petrany_MTJ.pdf")),
+       g3, width = 6, height = 5.5)
+
+write.table(
+    sdf %>% filter(mtj_membership != "none") %>%
+        dplyr::select(gene_name, mtj_membership, log2TE_MTJ, log2TE_CK8, delta_TE,
+                      te_class, int_padj),
+    file = file.path(outpath, DateNamer("table_kim_petrany_MTJ_markers.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* the Fig 1 TE table (detectable genes) annotated by membership in the Kim and Petrany
+MTJ signatures (`kim_mtj_signature()` / `petrany_mtj_signature()`, same method on each atlas).
+*Method:* the `log2TE_CK8` (x) vs `log2TE_MTJ` (y) scatter from Fig 1; genes are coloured by
+whether they are MTJ markers in **Kim only / Petrany only / both** (gray = neither), y=x diagonal
+shown. Labels = the published-MTJ markers that our analysis also calls translation-specific MTJ
+(`te_class == "translation_specific_MTJ"`). Membership table exported.
+*Shows:* whether the independently-published MTJ markers (Kim and Petrany) sit above the
+diagonal in our TE space — i.e. recapitulate our MTJ translation-specific calls — directly
+answering "compare to previously published transcriptomes of the MTJ".
+
+## Petrany snRNA pseudobulk (MTJ vs Rest) — snRNA-anchored translation `(canvas: 036)`
+
+*Why this section:* it builds an snRNA transcript reference from the Petrany atlas (pseudobulk MTJ
+vs Rest) and asks whether the Ribo-Tag translatome is cell-type-specific *relative to snRNA* — a
+cross-platform complement to the bulk-RNA TE in Figures 1–3.
+
+```{r petrany_pseudobulk_setup}
+suppressPackageStartupMessages(library(Seurat))
+sn = load_petrany_2020()
+# MTJ cluster = highest Tigd4+ fraction (canvas 037; was Col22a1+)
+tigd4_summary = FetchData(sn, vars = c("Tigd4", "Col22a1", "seurat_clusters")) %>%
+    group_by(seurat_clusters) %>%
+    summarize(pct_tigd4   = mean(Tigd4   > 0) * 100,
+              pct_col22a1 = mean(Col22a1 > 0) * 100, n_cells = n()) %>%
+    arrange(desc(pct_tigd4))
+mtj_cluster = as.character(tigd4_summary$seurat_clusters[1])
+sn$mtj_label = ifelse(as.character(sn$seurat_clusters) == mtj_cluster, "MTJ", "rest")
+message("Petrany MTJ cluster (highest Tigd4+): ", mtj_cluster,
+        " (Tigd4+ ", round(tigd4_summary$pct_tigd4[1], 1),
+        "%, Col22a1+ ", round(tigd4_summary$pct_col22a1[1], 1), "%)")
+
+pet_ctr = "MTJ_vs_rest_petrany"
+pet_de  = snRNA_pseudobulk_DE(seurat_obj = sn, group_col = "mtj_label", group_a = "MTJ",
+                              sample_col = "sample_id", contrast_name = pet_ctr)
+pet = pet_de %>% dplyr::transmute(
+    gene_name,
+    bm   = .data[[paste0("baseMean.",       pet_ctr)]],
+    lfc  = .data[[paste0("log2FoldChange.", pet_ctr)]],
+    padj = .data[[paste0("padj.",           pet_ctr)]],
+    diff = .data[[paste0("diff.",           pet_ctr)]])
+
+markers4 = c("Tigd4", "Col22a1", "Klf2", "Klf5")
+# pseudobulk positive-control oracle: Tigd4/Col22a1 must be MTJ-up in Petrany
+stopifnot(all(pet$lfc[pet$gene_name %in% c("Tigd4", "Col22a1")] > 0, na.rm = TRUE))
+
+# label top-10 by padj from the protein-coding, non-Gm pool (+ always markers4) — canvas 037
+pc_genes = annot %>% filter(gene_biotype == "protein_coding") %>% pull(gene_name) %>% unique()
+lab_de = pet %>%
+    filter(diff != "No", gene_name %in% pc_genes, !grepl("^Gm[0-9]", gene_name)) %>%
+    arrange(padj) %>% head(10) %>%
+    bind_rows(filter(pet, gene_name %in% markers4)) %>%
+    distinct(gene_name, .keep_all = TRUE)
+```
+
+*Method:* Petrany cells split MTJ (highest-`Col22a1+` cluster) vs rest; `snRNA_pseudobulk_DE`
+(per sample×group count sums → DESeq2 Wald, `|LFC|>0.75` & `padj<0.05`) — the same recipe report 07
+uses for this atlas, so the MTJ cluster and contrast match.
+
+## Figure 3b — snRNA marker violins (Petrany & Kim, MTJ vs rest) `(canvas: 064)`
+
+*Why this figure:* shows single-nucleus expression of **Klf2, Klf5, Cpne2, Arhgap25, Arhgap27** in the MTJ
+cluster vs all other nuclei, in **both** the Petrany and Kim atlases — testing whether these are
+MTJ-enriched at the transcriptional (snRNA) level across two independent datasets.
+
+```{r fig_marker_violins, fig.width=7, fig.height=8}
+suppressPackageStartupMessages({ library(Seurat); library(tidyr) })
+viol_genes = c("Klf2", "Klf5", "Cpne2", "Arhgap25", "Arhgap27")
+# Kim atlas MTJ = Col22a1-top cluster (pinned 17 in reports 05/07); Petrany MTJ = sn$mtj_label (above)
+kim = load_kim_birchmeier_2020()
+kim_mtj = top_marker_cluster(kim, "Col22a1")
+if(!identical(kim_mtj, "17")) message("WARNING: Kim Col22a1-top cluster is ", kim_mtj, " (expected 17)")
+kim$mtj_label = ifelse(as.character(kim$seurat_clusters) == kim_mtj, "MTJ", "rest")
+
+get_long = function(obj, ds){
+    g = intersect(viol_genes, rownames(obj))
+    if(length(g) < length(viol_genes))
+        message(ds, ": genes absent -> ", paste(setdiff(viol_genes, g), collapse = ", "))
+    FetchData(obj, vars = c(g, "mtj_label")) %>%
+        tidyr::pivot_longer(dplyr::all_of(g), names_to = "gene", values_to = "expr") %>%
+        mutate(dataset = ds)
+}
+vdf = dplyr::bind_rows(get_long(sn, "Petrany"), get_long(kim, "Kim")) %>%
+    mutate(mtj_label = factor(mtj_label, levels = c("MTJ", "rest")),
+           gene      = factor(gene, levels = viol_genes),
+           dataset   = factor(dataset, levels = c("Petrany", "Kim")))
+stopifnot(nrow(vdf) > 0)
+
+gv = ggplot(vdf, aes(mtj_label, expr, fill = mtj_label)) +
+    geom_violin(scale = "width", linewidth = 0.2) +
+    geom_boxplot(width = 0.12, outlier.size = 0.2, linewidth = 0.2, fill = "white") +
+    scale_fill_manual(values = c(MTJ = "#E88C8C", rest = "lightgray"), guide = "none") +
+    facet_wrap(gene ~ dataset, scales = "free_y", ncol = 2,
+               labeller = label_wrap_gen(multi_line = FALSE)) +
+    labs(x = NULL, y = "log-normalized expression") + globals$theme
+print(gv)
+ggsave(file.path(outpath, DateNamer("violin_markers_petrany_kim_MTJ_vs_rest.pdf")), gv, width = 7, height = 8)
+```
+
+*Input:* Petrany (`sn`, MTJ = highest-Tigd4⁺ cluster) and Kim (`kim`, MTJ = Col22a1-top cluster 17) snRNA;
+genes Klf2/Klf5/Cpne2/Arhgap25/Arhgap27. *Method:* per-nucleus log-normalized RNA expression, `geom_violin`
+(width-scaled) + inner boxplot, MTJ vs rest, faceted **gene × dataset** with a free y-axis per panel
+(Petrany and Kim are on different platforms/scales, so each panel is scaled independently). *Shows:* whether each marker is
+transcriptionally MTJ-enriched in both atlases. PDF `violin_markers_petrany_kim_MTJ_vs_rest.pdf`.
+
+## Figure 4 — Petrany pseudobulk MA plot `(canvas: 036)`
+
+```{r fig4_petrany_MA, fig.width=6, fig.height=5}
+g_ma = ggplot(pet, aes(log10(bm + 1), lfc)) +
+    geom_point(color = "lightgray", size = 0.4) +
+    geom_point(data = filter(pet, diff == "Up"),   color = "#E88C8C", size = 0.5) +
+    geom_point(data = filter(pet, diff == "Down"), color = "#8CC6E8", size = 0.5) +
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab_de, aes(label = gene_name), size = 2.8,
+                    max.overlaps = Inf, min.segment.length = 0) +
+    labs(x = "log10(baseMean + 1)", y = "log2FC  (Petrany snRNA MTJ vs rest)") + globals$theme
+print(g_ma)
+ggsave(file.path(outpath, DateNamer("MA_petrany_pseudobulk.pdf")), g_ma, width = 6, height = 5)
+```
+
+*Input/Method:* the `pet` pseudobulk result; `x = log10(baseMean+1)`, `y = log2FC`; Up red / Down
+blue / n.s. grey; labels = `markers4` + top-10 by `padj` drawn from the **protein-coding, non-`Gm`**
+pool (canvas 037).
+*Shows:* the MTJ-vs-rest transcriptional contrast in Petrany — Tigd4/Col22a1 strongly MTJ-up.
+
+## Figure 5 — Petrany pseudobulk volcano `(canvas: 036)`
+
+```{r fig5_petrany_volcano, fig.width=6, fig.height=5}
+g_v = ggplot(pet, aes(lfc, -log10(padj))) +
+    geom_point(color = "lightgray", size = 0.4) +
+    geom_point(data = filter(pet, diff == "Up"),   color = "#E88C8C", size = 0.5) +
+    geom_point(data = filter(pet, diff == "Down"), color = "#8CC6E8", size = 0.5) +
+    geom_vline(xintercept = c(-0.75, 0.75), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05),   linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab_de, aes(label = gene_name), size = 2.8,
+                    max.overlaps = Inf, min.segment.length = 0) +
+    labs(x = "log2FC  (Petrany MTJ vs rest)", y = "-log10 padj") + globals$theme
+print(g_v)
+ggsave(file.path(outpath, DateNamer("volcano_petrany_pseudobulk.pdf")), g_v, width = 6, height = 5)
+```
+
+*Input/Method:* `pet`; `x = log2FC`, `y = -log10(padj)`; dashed gates at `±0.75` and `padj = 0.05`;
+same Up/Down colouring and labels as the MA.
+*Shows:* significance vs effect size of the Petrany MTJ-vs-rest calls.
+
+## Figure 6 — Cross-platform TE scatter: Ribo-Tag / Petrany snRNA `(canvas: 036)`
+
+```{r fig6_cross_te_scatter, fig.width=6, fig.height=5.5}
+pet_mean = cluster_mean_expr(sn, group_col = "mtj_label")   # log-norm means; cols MTJ, rest
+pet_lin  = expm1(pet_mean)                                  # back-transform to linear normalized expr
+cross = te %>% dplyr::select(gene_name, ribo_MTJ, ribo_CK8) %>%
+    inner_join(data.frame(gene_name   = rownames(pet_lin),
+                          petrany_MTJ  = pet_lin[, "MTJ"],
+                          petrany_rest = pet_lin[, "rest"], row.names = NULL),
+               by = "gene_name") %>%
+    mutate(y = log2((ribo_MTJ + 1) / (petrany_MTJ  + 1)),
+           x = log2((ribo_CK8 + 1) / (petrany_rest + 1)),
+           d = y - x) %>%
+    left_join(dplyr::select(pet, gene_name, pet_lfc = lfc, pet_padj = padj), by = "gene_name")
+
+top_up   = cross %>% arrange(desc(d)) %>% head(15)
+top_down = cross %>% arrange(d)       %>% head(15)
+lab_sc   = bind_rows(filter(cross, gene_name %in% markers4), top_up, top_down) %>%
+    distinct(gene_name, .keep_all = TRUE)
+
+g_sc = ggplot(cross, aes(x, y)) +
+    geom_point(color = "lightgray", size = 0.5, alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab_sc, aes(label = gene_name), size = 2.6, color = "black",
+                    max.overlaps = Inf, min.segment.length = 0) +
+    labs(x = "log2 ( CK8 Ribo-Tag / Petrany non-MTJ )",
+         y = "log2 ( MTJ Ribo-Tag / Petrany MTJ )") + globals$theme
+print(g_sc)
+ggsave(file.path(outpath, DateNamer("scatter_ribo_over_petrany_MTJ_vs_CK8.pdf")),
+       g_sc, width = 6, height = 5.5)
+
+write.table(
+    cross %>% dplyr::select(gene_name, ribo_MTJ, ribo_CK8, petrany_MTJ, petrany_rest,
+                            x, y, d, pet_lfc, pet_padj),
+    file = file.path(outpath, DateNamer("table_ribo_over_petrany_TE.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* per-gene Ribo-Tag normalized means (`TE$te$ribo_MTJ`, `ribo_CK8`) and Petrany per-group
+mean expression (`cluster_mean_expr` on `mtj_label`, back-transformed to linear by `expm1`).
+*Method:* `y = log2((MTJ Ribo + 1) / (Petrany MTJ + 1))`,
+`x = log2((CK8 Ribo + 1) / (Petrany non-MTJ + 1))`; dashed `y = x`; labels = Tigd4/Col22a1/Klf2/Klf5
++ top-15 up/down by the off-diagonal `d = y − x`.
+*Caveat:* Ribo-Tag (bulk) and Petrany (snRNA) are different platforms/scales, so each axis carries a
+**global offset** — the ratios are *relative*, not calibrated TE. The signal is the **off-diagonal**
+structure (above `y = x` = relatively more Ribo-loaded-vs-snRNA at MTJ than CK8), robust to a shared
+offset.
+*Shows:* MTJ-translation-biased genes sit above the diagonal; Tigd4/Col22a1/Klf2 expected there.
+
+## Figure 7 — obsolete, removed
+
+*The Petrany pseudobulk heatmap previously here (canvas 036) was removed as obsolete (canvas 055);
+Figures 8 and 9 keep their numbers. The snRNA pseudobulk pattern is now covered by Figure 9.*
+
+## Figure 8 — Volcano: MTJ vs CK8 translation efficiency (Ribo / snRNA) `(canvas: 050, 053)`
+
+*Why this figure:* a volcano for the snRNA-normalized translation efficiency — does a gene's
+Ribo/snRNA ratio differ between MTJ and CK8? The effect and its significance both come from a
+**joint DESeq2 interaction** (`assay:cell`) over Ribo-Tag and Petrany pseudobulk, so the p-value
+matches the effect (unlike borrowing the Ribo-only contrast).
+
+```{r fig8_ribo_snrna_volcano, fig.width=6, fig.height=5.5}
+suppressPackageStartupMessages({ library(DESeq2); library(Matrix) })
+# Ribo-Tag counts (MTJ/CK8) from the joint TE dds, relabelled gene_id -> symbol
+rc = round(DESeq2::counts(TE$dds)[, TE$cdata$assay == "ribo", drop = FALSE])
+sym = annot$gene_name[match(rownames(rc), annot$gene_id)]
+keep = !is.na(sym) & !duplicated(sym); rc = rc[keep, , drop = FALSE]; rownames(rc) = sym[keep]
+ribo_cell = TE$cdata$condition[TE$cdata$assay == "ribo"]            # MTJ / CK8
+# Petrany pseudobulk counts per (sample x mtj_label); rest -> CK8 side
+cnt_sn = SeuratObject::GetAssayData(sn, assay = "RNA", layer = "counts")
+pkey   = factor(paste(sn$sample_id, sn$mtj_label, sep = "__"))
+pind   = Matrix::sparse.model.matrix(~ 0 + pkey); colnames(pind) = levels(pkey)
+pb     = round(as.matrix(cnt_sn %*% pind))
+sn_cell = ifelse(endsWith(colnames(pb), "__MTJ"), "MTJ", "CK8")
+# joint interaction model over the common genes
+gi  = intersect(rownames(rc), rownames(pb))
+mat = cbind(rc[gi, , drop = FALSE], pb[gi, , drop = FALSE]); mat = mat[rowSums(mat) > 0, , drop = FALSE]
+cdi = data.frame(assay = factor(c(rep("ribo", ncol(rc)), rep("snrna", ncol(pb))), levels = c("snrna","ribo")),
+                 cell  = factor(c(as.character(ribo_cell), sn_cell), levels = c("CK8","MTJ")),
+                 row.names = colnames(mat))
+dds_i = DESeq(DESeqDataSetFromMatrix(mat, cdi, ~ assay + cell + assay:cell), quiet = TRUE)
+iname = grep("assay.+cell", DESeq2::resultsNames(dds_i), value = TRUE)[1]
+vol = as.data.frame(DESeq2::results(dds_i, name = iname)) %>%
+    tibble::rownames_to_column("gene_name") %>%
+    dplyr::transmute(gene_name, lfc = log2FoldChange, padj) %>%
+    filter(!is.na(padj)) %>%
+    mutate(biotype = annot$gene_biotype[match(gene_name, annot$gene_name)],
+           dir = case_when(padj < 0.05 & lfc >  0.75 ~ "MTJ-up TE",
+                           padj < 0.05 & lfc < -0.75 ~ "CK8-up TE",
+                           TRUE                      ~ "ns"))
+cat(sprintf("Joint interaction term: %s | %d genes tested | MTJ-up %d / CK8-up %d significant.\n",
+            iname, nrow(vol), sum(vol$dir=="MTJ-up TE"), sum(vol$dir=="CK8-up TE")))
+
+# shoulder diagnosis + y-cap (canvas 071). The negative-lfc "second distribution" is a pseudobulk-asymmetry
+# artifact: the Petrany MTJ pseudobulk comes from few nuclei, so those genes have near-zero snRNA-MTJ counts.
+# NOTE: genes are NOT dropped — a min-count filter would remove the labelled Arhgap27/Klf2 (canvas 073).
+vol$mtj_pb = rowSums(pb[, endsWith(colnames(pb), "__MTJ"), drop = FALSE])[vol$gene_name]
+vol = vol %>% mutate(logp = pmin(-log10(padj), 10), capped = -log10(padj) > 10)
+n_capped = sum(vol$capped)
+cat(sprintf("Shoulder: mean snRNA-MTJ pseudobulk = %.1f (lfc< -2) vs %.1f (|lfc|<1); %d genes capped at -log10padj=10.\n",
+            mean(vol$mtj_pb[vol$lfc < -2], na.rm = TRUE), mean(vol$mtj_pb[abs(vol$lfc) < 1], na.rm = TRUE), n_capped))
+
+# label only the top-15 up / top-15 down PROTEIN-CODING significant genes (+ markers incl. Cpne2/Arhgap27) (canvas 053, 071)
+vol_pc = vol %>% filter(dir != "ns", biotype %in% "protein_coding")
+lab_v = bind_rows(
+    vol_pc %>% arrange(desc(lfc)) %>% head(15),
+    vol_pc %>% arrange(lfc)       %>% head(15),
+    vol    %>% filter(gene_name %in% c(markers4, "Arhgap27", "Cpne2"))) %>% distinct(gene_name, .keep_all = TRUE)
+
+base_vol = ggplot(vol, aes(lfc, logp)) +
+    geom_point(color = "lightgray", size = 0.5, alpha = 0.6) +
+    geom_point(data = filter(vol, dir == "MTJ-up TE"), color = "#E88C8C", size = 0.7) +
+    geom_point(data = filter(vol, dir == "CK8-up TE"), color = "#8CC6E8", size = 0.7) +
+    geom_point(data = filter(vol, capped), shape = 17, size = 1.6, color = "black") +   # -log10padj>10 shown at 10
+    geom_vline(xintercept = c(-0.75, 0.75), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05),   linetype = 2, linewidth = 0.25) +
+    labs(x = "log2 TE interaction  (MTJ vs CK8, Ribo / snRNA)", y = "-log10 padj (capped at 10)") + globals$theme
+
+g_vol = base_vol +
+    geom_text_repel(data = lab_v, aes(label = gene_name), size = 2.6, max.overlaps = Inf,
+                    min.segment.length = 0)
+print(g_vol)
+ggsave(file.path(outpath, DateNamer("volcano_ribo_over_snrna_MTJ_vs_CK8.pdf")), g_vol, width = 6, height = 5.5)
+# unlabelled companion (canvas 053)
+print(base_vol)
+ggsave(file.path(outpath, DateNamer("volcano_ribo_over_snrna_MTJ_vs_CK8_nolabels.pdf")), base_vol, width = 6, height = 5.5)
+write.table(vol, file = file.path(outpath, DateNamer("table_ribo_over_snrna_volcano.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+# export the MTJ-up-TE genes from this volcano (padj<0.05 & lfc>0.75) (canvas 074)
+write.table(vol %>% filter(dir == "MTJ-up TE") %>%
+            dplyr::select(gene_name, lfc, padj, biotype) %>% arrange(desc(lfc)),
+            file = file.path(outpath, DateNamer("table_up_F8_riboSnRNA_MTJ.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# oracle (canvas 071): Arhgap27 + Cpne2 labelled; y-axis capped at 10; shoulder confirmed low-MTJ-support
+stopifnot(all(c("Arhgap27","Cpne2") %in% lab_v$gene_name), max(vol$logp) <= 10 + 1e-9,
+          mean(vol$mtj_pb[vol$lfc < -2], na.rm = TRUE) < mean(vol$mtj_pb[abs(vol$lfc) < 1], na.rm = TRUE))
+```
+
+*Input:* Ribo-Tag MTJ/CK8 counts (joint `TE$dds`) + Petrany snRNA pseudobulk counts (per
+`sample_id × mtj_label`; rest → CK8), common genes.
+*Method:* one `DESeqDataSet` over {Ribo-Tag, Petrany-snRNA}×{MTJ, CK8}, `~ assay + cell + assay:cell`;
+the **`assay:cell` interaction** LFC (≈ MTJ-vs-CK8 difference of the Ribo/snRNA ratio) on x,
+−log10(interaction padj) on y (**capped at 10** — the few genes above 10 are drawn at 10 as black
+triangles). Dashed gates at `±0.75` / `padj 0.05`. **Labels (canvas 053, 071):** the top-15 up + top-15 down
+**protein-coding** significant genes by LFC, plus Tigd4/Col22a1/Klf2/Klf5 **and Cpne2/Arhgap27**; an
+**unlabelled companion** volcano (`…_nolabels.pdf`) is saved alongside for the full point cloud.
+*The two distributions:* the left "second cloud" (large **negative** LFC) is a **pseudobulk-asymmetry
+artifact**, not biology — the Petrany MTJ pseudobulk is built from few nuclei, so those genes have near-zero
+snRNA-MTJ counts (the diagnostic prints the mean snRNA-MTJ pseudobulk count for the lfc<−2 shoulder vs the
+main cloud). Genes are deliberately **not** filtered out: an snRNA-MTJ min-count filter would remove the
+labelled markers themselves (Arhgap27/Klf2) and does not fix the shoulder (canvas 073).
+*Caveat:* Ribo-Tag (bulk) and Petrany (snRNA) are different platforms — the interaction p ranks
+genes, it is not a calibrated cross-platform FDR.
+*Shows:* genes whose translation efficiency differs between MTJ and CK8 once snRNA transcription is
+accounted for.
+
+## Figure 9 — Ribo × Petrany-snRNA contingency (Up/None/Down) heatmap `(canvas: 051, 054, 062)`
+
+*Why this figure:* a standalone heatmap of translation (Ribo-Tag) × **single-nucleus** transcription
+(Petrany pseudobulk) — the snRNA analogue of Figure 2, with its own snRNA-native gene membership.
+
+```{r fig9_ribo_snrna_heatmap_petrany, fig.width=7, fig.height=10}
+# Petrany twin of Figure 2b: classify Ribo and Petrany snRNA each Up/None/Down at |log2FC|>1 (canvas 062)
+pet_lin_df = data.frame(gene_name = rownames(pet_lin), snrna_MTJ = pet_lin[, "MTJ"],
+                        snrna_rest = pet_lin[, "rest"], row.names = NULL)
+snall = ptab %>% dplyr::select(gene_name, ribo_lfc, ribo_diff, in_kim, in_petrany) %>%
+    inner_join(dplyr::select(pet, gene_name, pet_lfc = lfc, pet_diff = diff), by = "gene_name") %>%
+    inner_join(dplyr::distinct(dplyr::select(te, gene_name, ribo_MTJ, ribo_CK8)), by = "gene_name") %>%
+    inner_join(pet_lin_df, by = "gene_name") %>%
+    filter(!is.na(ribo_lfc), !is.na(pet_lfc)) %>%
+    mutate(ribo_cls = cls3(ribo_diff, ribo_lfc, 1), pet_cls = cls3(pet_diff, pet_lfc, 1))
+
+# 3-row table: riboseq / snRNA / count per Up/None/Down combination (canvas 062)
+print(flat3_kable(snall$ribo_cls, snall$pet_cls, "snRNA",
+    "Ribo × Petrany-snRNA counts at |log2FC|>1 & padj<0.05 (per Up/None/Down combination). Translational targets = (riboseq Up, snRNA None)."))
+
+snset = snall %>%
+    filter(ribo_cls != "None") %>%                            # ribo-significant genes (the 2-row table)
+    mutate(pattern = factor(paste0("Ribo ", ribo_cls, " / snRNA ", pet_cls),
+                            levels = c("Ribo Up / snRNA Up","Ribo Up / snRNA None","Ribo Up / snRNA Down",
+                                       "Ribo Down / snRNA Up","Ribo Down / snRNA None","Ribo Down / snRNA Down"))) %>%
+    droplevels() %>% arrange(pattern, desc(abs(ribo_lfc) + abs(pet_lfc)))
+cat(sprintf("Petrany-snRNA contingency heatmap (canvas 062): %d ribo-significant genes at |log2FC|>1 & padj<0.05.\n",
+            nrow(snset)))
+stopifnot(nrow(snset) >= 4)
+
+rawP = snset %>% dplyr::transmute(Ribo_MTJ = log2(ribo_MTJ + 1), snRNA_MTJ = log2(snrna_MTJ + 1),
+                                  Ribo_CK8 = log2(ribo_CK8 + 1), snRNA_rest = log2(snrna_rest + 1)) %>% as.matrix()
+rownames(rawP) = make.unique(snset$gene_name)
+# column z-score first (put the two platforms' columns on a common scale), THEN row z-score (canvas 054)
+m1    = scale(rawP)
+matzP = t(scale(t(m1))); matzP[!is.finite(matzP)] = 0
+labP  = sort(unique(c(which(snset$gene_name %in% named),
+                      snset %>% mutate(.r = row_number()) %>% group_by(pattern) %>% slice_head(n = 5) %>% pull(.r))))
+hP = Heatmap(matzP, name = "z(log2 norm)",
+        col = colorRamp2(c(-2,0,2), c("#8CC6E8","white","#E88C8C")),
+        row_split = snset$pattern, row_title_rot = 0, row_gap = unit(0,"mm"), border = TRUE,
+        cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE, show_row_dend = FALSE,
+        left_annotation = rowAnnotation(Kim = snset$in_kim, Petrany = snset$in_petrany,
+            col = list(Kim = c(`TRUE`="#444444",`FALSE`="white"), Petrany = c(`TRUE`="#E88C8C",`FALSE`="white"))),
+        right_annotation = rowAnnotation(mark = anno_mark(at = labP, labels = rownames(rawP)[labP],
+            labels_gp = grid::gpar(fontsize = 8))))
+pdf(file.path(outpath, DateNamer("heatmap_ribo_snrna_patterns_petrany.pdf")), width = 7, height = 10)
+draw(hP); dev.off(); draw(hP)
+write.table(snset, file = file.path(outpath, DateNamer("table_ribo_snrna_patterns_petrany.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Classification:* the **Petrany equivalent of Figure 2b** — each gene called **Up / None / Down**
+separately in Ribo-Tag (MTJ/CK8) and in Petrany snRNA (MTJ-vs-rest) at `padj<0.05 & |log2FC|>1`. The
+table above has three rows (riboseq / snRNA / count) with one column per Up/None/Down combination. The
+heatmap shows the ribo-significant genes split into the six cells, group labels horizontal +
+line-separated (canvas 062).
+*Method:* columns = `log2(mean+1)` of Ribo-Tag MTJ/CK8 (`te`) and Petrany snRNA MTJ/rest (`pet_lin`);
+**column z-score then row z-score** (canvas 054) so the two platforms' columns are commensurate;
+Kim/Petrany annotation + Klf2/Klf5/Tigd4/Col22a1 + top-5/cell labels.
+*Caveat:* the snRNA arm is MTJ-vs-**rest** (not vs CK8); mixes bulk Ribo-Tag with snRNA pseudobulk, so
+row z-score patterns are interpretable but absolute column scales are not directly comparable.
+*Shows:* the Ribo×snRNA significance grid — in particular the **(Ribo Up, snRNA None)** translational
+targets — the single-nucleus analogue of Figure 2b.
+
+## MTJ translational targets (manuscript-comparable count) `(canvas: 058)`
+
+*Why this section:* the manuscript claims "~80% of MTJ ribosome-enriched transcripts (170 of 209;
+FC>2, p<0.05) are not transcriptionally enriched in published snRNA-seq or in our bulk RNA-seq from
+GFP⁺ MTJ nuclei … authentic translational targets of the MTJ." This reproduces that exact definition on
+the current data so the report carries a directly comparable number + gene list.
+
+```{r mtj_translational_targets}
+# manuscript definition (canvas 058): Ribo-Tag MTJ-up at FC>2 & padj<0.05, NOT transcriptionally
+# enriched in snRNA (Petrany cluster 26 OR Kim cluster 17 marker) OR bulk RNA (Tigd4/CK8 MTJ-up).
+ms = ptab %>% mutate(
+    ribo_enriched    = ribo_diff == "Up" & ribo_lfc > 1,        # FC>2 (log2FC>1); padj<0.05 is in ribo_diff
+    tx_snRNA         = in_petrany | in_kim,
+    tx_bulk          = rna_diff == "Up",
+    tx_enriched      = tx_snRNA | tx_bulk,
+    translation_only = ribo_enriched & !tx_enriched)
+n_ribo = sum(ms$ribo_enriched); n_to = sum(ms$translation_only)
+stopifnot(n_to <= n_ribo)
+cat(sprintf("MTJ ribosome-enriched (FC>2 & padj<0.05): %d | translational-only (not snRNA/bulk): %d = %.0f%%\n",
+            n_ribo, n_to, 100 * n_to / n_ribo))
+cat(sprintf("  of the %d ribosome-enriched, excluded by: snRNA(Petrany/Kim) %d | bulk RNA %d | both %d\n",
+            n_ribo,
+            sum(ms$ribo_enriched & ms$tx_snRNA),
+            sum(ms$ribo_enriched & ms$tx_bulk),
+            sum(ms$ribo_enriched & ms$tx_snRNA & ms$tx_bulk)))
+# controls: Klf2 should be a translational target; Col22a1/Tigd4 (transcriptional) must NOT be
+for(g in c("Klf2","Col22a1","Tigd4"))
+    if(g %in% ms$gene_name[ms$ribo_enriched])
+        cat("  ", g, "-> translation_only =", ms$translation_only[ms$gene_name == g], "\n")
+
+write.table(ms %>% filter(ribo_enriched) %>%
+                dplyr::select(gene_id, gene_name, ribo_lfc, rna_diff, in_petrany, in_kim, translation_only) %>%
+                arrange(desc(translation_only), desc(ribo_lfc)),
+            file = file.path(outpath, DateNamer("table_MTJ_translational_targets.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* `ptab` (the four-pattern table) — Ribo-Tag MTJ/CK8 (`ribo_diff`/`ribo_lfc`), bulk RNA Tigd4/CK8
+(`rna_diff`), and published-snRNA MTJ-marker flags (`in_petrany` = Petrany cluster 26, `in_kim` = Kim
+cluster 17). *Method:* ribosome-enriched = `ribo_diff=="Up" & ribo_lfc>1` (FC>2 & padj<0.05);
+translational-only = ribosome-enriched AND not (`in_petrany | in_kim | rna_diff=="Up"`). Exports
+`table_MTJ_translational_targets.tsv`. *Divergence from the manuscript (209/170):* the current FC>2
+ribosome-enriched count is larger than the manuscript's 209 — the translational-only **fraction** (~80%)
+is preserved, but the **denominator grew** because the Ribo-Tag DE is recomputed on the current pipeline
+(Ensembl 113 / mm39) and the snRNA reference was rebuilt (Petrany switched to Synapse-CellRanger and
+re-clustered to cluster 26; Kim cluster 17). This number is the reproducible current analogue, not a
+re-derivation of 209. *Shows:* the size and gene identity of the MTJ translational-target set on the
+current data.
+
+## bioRxiv reconciliation — current FC>2 ribo-Up vs the manuscript supplement `(canvas: 059)`
+
+*Why this section:* reconciles the current MTJ ribosome-enriched set against the bioRxiv supplement
+(`Documentation/kim-franke-biorxiv.xlsx`, sheet **"SED MTJ vs CK8"** = the sedentary Ribo-Tag MTJ-vs-CK8
+contrast, `diff=="Up"` = 210 genes at FC>2). Quantifies overlap / lost / gained and the per-gene LFC
+concordance, so the count difference is auditable.
+
+```{r biorxiv_reconciliation}
+suppressPackageStartupMessages(library(readxl))
+biorxiv = file.path(.scripts.path, "Documentation", "kim-franke-biorxiv.xlsx")
+M = suppressMessages(read_excel(biorxiv, sheet = "SED MTJ vs CK8")) %>%
+    filter(diff == "Up") %>%
+    transmute(gene_id = sub("\\..*", "", gene_id), gene_name, m_lfc = lfc)
+C = ptab %>% filter(ribo_diff == "Up", ribo_lfc > 1) %>%
+    transmute(gene_id = sub("\\..*", "", gene_id), gene_name, c_lfc = ribo_lfc)
+overlap = intersect(M$gene_id, C$gene_id)
+lost    = setdiff(M$gene_id, C$gene_id)         # manuscript Up, not current FC>2 Up
+gained  = setdiff(C$gene_id, M$gene_id)         # current FC>2 Up, not in the manuscript supplement
+shared  = inner_join(M, C, by = "gene_id")
+r_lfc   = cor(shared$m_lfc, shared$c_lfc)
+cat(sprintf("bioRxiv SED-MTJ-vs-CK8 Up = %d | current FC>2 ribo-Up = %d | overlap %d / lost %d / gained %d | shared-gene LFC Pearson r = %.3f\n",
+            nrow(M), nrow(C), length(overlap), length(lost), length(gained), r_lfc))
+stopifnot(length(overlap) + length(lost)   == nrow(M),   # set identities
+          length(overlap) + length(gained) == nrow(C))
+
+recon = rbind(data.frame(gene_id = overlap, status = "overlap"),
+              data.frame(gene_id = lost,    status = "lost"),
+              data.frame(gene_id = gained,  status = "gained")) %>%
+    left_join(M %>% dplyr::select(gene_id, gene_name, m_lfc), by = "gene_id") %>%
+    left_join(C %>% dplyr::rename(c_name = gene_name), by = "gene_id") %>%
+    mutate(gene_name = dplyr::coalesce(gene_name, c_name)) %>%
+    dplyr::select(gene_id, gene_name, status, m_lfc, c_lfc)
+write.table(recon, file = file.path(outpath, DateNamer("table_biorxiv_reconciliation.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* bioRxiv supplement Up set (sheet "SED MTJ vs CK8", FC>2) vs the current `ptab` FC>2 ribo-Up set,
+matched by Ensembl gene_id. *Method:* set overlap/lost/gained + Pearson r of the shared genes' Ribo-Tag
+LFCs; exports `table_biorxiv_reconciliation.tsv` (gene_id, gene_name, status, manuscript LFC, current
+LFC). *Shows:* the per-gene quantification is essentially unchanged (high LFC r); the count difference is
+driven by the knife-edge FC>2 cut + a larger tested universe, not by re-analysis.
+
+## Control checks
+
+```{r controls}
+pos_ctrl = te %>% filter(gene_name %in% pos_control) %>%
+    dplyr::select(gene_name, log2TE_MTJ, log2TE_CK8, delta_TE, int_padj, te_class)
+conc = te %>% filter(gene_name %in% gset) %>%
+    dplyr::select(gene_name, log2TE_MTJ, log2TE_CK8, delta_TE, te_class)
+neg = te %>% filter(gene_name %in% housekeeping) %>%
+    dplyr::select(gene_name, log2TE_MTJ, log2TE_CK8, delta_TE, te_class)
+
+knitr::kable(pos_ctrl, digits = 2,
+    caption = "POSITIVE control (translation-specific) — Klf2: expect delta_TE clearly > 0 (preferential MTJ ribosome loading, above the diagonal).")
+knitr::kable(conc, digits = 2,
+    caption = "Transcriptional MTJ markers — expected CONCORDANT (delta_TE ~ 0, class = ns): TE removes the transcriptional MTJ signal, so these should NOT be flagged translation-specific.")
+knitr::kable(neg, digits = 2,
+    caption = "Housekeeping genes — expected no cell-type difference in translation efficiency (delta_TE ~ 0).")
+```
+
+*Positive control:* Klf2 is translationally up in MTJ — expect `delta_TE > 0`, above the
+diagonal. (Effect is strong and directionally correct; at n=3 MTJ replicates it does not
+clear `int_padj < 0.05`, a power limitation, not a direction problem.)
+*Transcriptional markers:* Tigd4/Col22a1/Ccn2/Klf5 are MTJ markers driven by transcription;
+because TE = Ribo/RNA divides transcript abundance out, they are expected near the diagonal
+(`delta_TE ≈ 0`, class `ns`). A strong off-diagonal swing here would point to a normalization
+artifact, not biology.
+*Housekeeping:* expect `delta_TE` near 0; note absolute `log2TE` is NOT expected to be 0
+(ribosome-footprint vs transcript scale differs per gene) — only the MTJ-vs-CK8 *difference*
+is the control.
+
+## Supplementary — DE sanity (cached single-modality contrasts)
+
+```{r supp_volcano, fig.width=8, fig.height=4}
+# Demoted from headline: the single-modality DESeq2 volcanoes, for sanity only.
+ribo = Riboseq_Differential_Expression()
+rna  = RNAseq_Differential_Expression()
+rc   = "MTJ_HA.Rpl22_CK8_HA.Rpl22"; nc = "Tigd4_CK8"
+
+mk_volcano = function(res, contrast, xlab){
+    d = res$res %>% dplyr::rename(gene_id = id) %>%
+        left_join(annot, by = "gene_id") %>%
+        filter(gene_biotype == "protein_coding") %>%
+        mutate(lpval = -log10(.data[[paste0("padj.", contrast)]]),
+               diff  = .data[[paste0("diff.", contrast)]])
+    ggplot(d, aes(.data[[paste0("log2FoldChange.", contrast)]], lpval)) +
+        geom_point(color = "lightgray", size = 0.4) +
+        geom_point(data = dplyr::filter(d, diff == "Up"),   color = "#E88C8C", size = 0.4) +
+        geom_point(data = dplyr::filter(d, diff == "Down"), color = "#8CC6E8", size = 0.4) +
+        labs(x = xlab, y = "-log10 padj") + globals$theme
+}
+print(patchwork::wrap_plots(
+    mk_volcano(ribo, rc, "log2 Ribo MTJ/CK8"),
+    mk_volcano(rna,  nc, "log2 RNA Tigd4/CK8"), ncol = 2))
+```
+
+*Shows:* the raw single-modality contrasts (ribosome-bound MTJ/CK8 and total-RNA
+Tigd4/CK8) for reference — neither separates translation from abundance on its own; the
+TE analysis above is what the reviewer asked for.
+
+## Session info
+
+```{r}
+sessionInfo()
+```

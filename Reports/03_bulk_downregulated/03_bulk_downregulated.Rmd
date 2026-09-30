@@ -1,0 +1,468 @@
+---
+title: "03 — Bulk RNA-seq downregulated genes (Tigd4 vs CK8)"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Reviewer question — Q3.** Which genes are downregulated in MTJ in the bulk RNA-seq CK8 vs Tigd4 contrast (Fig 1F), where the reviewer noted few genes appear down — produce the explicit gene list plus GO terms.
+>
+> **Purpose.** This report delivers the explicit down-in-MTJ gene list from the Tigd4 vs CK8 DESeq2 contrast and characterises it functionally via GO enrichment, supplying exactly the gene list and GO terms the reviewer requested.
+
+<!--
+# Canvas: Prompts/canvases/003_bulk-downregulated.md
+Reviewer Q3 (research_plan.md): what are the downregulated genes in Figure 1F
+(bulk RNA-seq CK8 vs Tigd4)?
+
+Upstream: RNAseq_Differential_Expression() cached RDS.
+Helpers : Scripts/Bin/DE_Reporting.R (classify_DE)
+          Scripts/Bin/GO_Enrichment.R (run_GO, go_on_class)
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(ggplot2)
+    library(ggrepel)
+    library(ComplexHeatmap)
+})
+source.lib("ScanLib.R")
+source.lib("Bacon.R")
+source.lib("Read_Annotation.R")
+source.pro("Differential_Expression.R")
+source.pro("DE_Reporting.R")
+source.pro("GO_Enrichment.R")
+
+report_name = "03_bulk_downregulated"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+
+path_gtf = "/data/local/vfranke/Annotation/mm39/EnsemblGenes/Mus_musculus.GRCm39.113.chr.gtf"
+annot    = read_Gene_Annotation(path_gtf)
+
+contrast = "Tigd4_CK8"
+```
+
+## Load and classify
+
+```{r}
+rna = RNAseq_Differential_Expression()
+# $res carries only id/LFC/padj/diff; pull the per-group mean expression from
+# $dat to build an MA x-axis (mean normalized expression across the two groups).
+rna_res = rna$res %>%
+    dplyr::rename(gene_id = id) %>%
+    left_join(annot, by = "gene_id") %>%
+    left_join(dplyr::select(rna$dat, gene_id, mean.CK8, mean.Tigd4),
+              by = "gene_id") %>%
+    mutate(baseMean = (mean.CK8 + mean.Tigd4) / 2) %>%
+    classify_DE(contrast, lfc_cut = 0.5)
+
+diff_col = paste0("diff.", contrast)
+down = rna_res %>%
+    filter(.data[[diff_col]] == "Down",
+           gene_biotype == "protein_coding")
+message("Down genes: ", nrow(down))
+```
+
+## Differential expression method
+
+Bulk RNA-seq counts (Salmon → gene level) were tested with **DESeq2** (Wald test) via
+`summarize_PigX_RNAseq()`, design `~ Factor`, contrast **Tigd4 vs CK8** (numerator Tigd4,
+the MTJ-sorted population). Sample `Tigd4_br2` was excluded upstream on QC. A gene is called
+**down in MTJ** when `log2FoldChange.Tigd4_CK8 < -0.5` **and** `padj < 0.05` (Benjamini–
+Hochberg), restricted to `gene_biotype == "protein_coding"`. The GO universe is all tested
+protein-coding genes. The fold-change cut is **relaxed to 0.5** here (vs the project-wide
+`0.75`) because the reviewer noted few genes are called down in MTJ — the looser cut recovers
+the weaker-but-consistent down-regulated set.
+
+## Figure 1 — MA plot, down highlighted
+
+*Why this figure:* Labels every down-in-MTJ gene against expression level, making the reviewer's "very few genes are down" claim quantitative and naming each member of the down set the question asks for.
+
+```{r fig1_MA, fig.width=5, fig.height=4}
+plot_df = rna_res %>% filter(gene_biotype == "protein_coding") %>%
+    mutate(base = .data[["baseMean"]])
+
+g = ggplot(plot_df,
+           aes(log10(base + 1),
+               .data[[paste0("log2FoldChange.", contrast)]])) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(plot_df, .data[[diff_col]] == "Down"),
+               color = "#8CC6E8", size = 0.5) +
+    geom_hline(yintercept = 0, linewidth = 0.25) +
+    geom_hline(yintercept = -0.5, linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = dplyr::filter(plot_df, .data[[diff_col]] == "Down"),
+                    aes(label = gene_name), size = 2.5,
+                    min.segment.length = 0, max.overlaps = Inf) +
+    labs(x = "log10 baseMean", y = "log2 Tigd4 / CK8") +
+    globals$theme
+print(g)
+ggsave(file.path(outpath, DateNamer("MA_Tigd4_vs_CK8.pdf")),
+       g, width = 5, height = 4)
+```
+
+*Input:* bulk RNA-seq DE (Tigd4 vs CK8), protein-coding only.
+*Method:* baseMean on x vs log2FC on y, down-set highlighted (`classify_DE`, `lfc_cut = 0.5`).
+The dashed horizontal line marks the **−0.5** down threshold. **All** down-in-MTJ genes are labelled.
+*Shows:* where the down genes lie on the expression spectrum — the reviewer's "very few genes are down" observation.
+
+## Figure 2 — Volcano (Tigd4 vs CK8)
+
+*Why this figure:* puts the reviewer's down set in the full DE context — the 11 down-in-MTJ
+genes (light blue) against every tested gene, with the canonical MTJ markers Tigd4/Col22a1
+shown for orientation — making plain that the down set is small relative to the up-regulated
+MTJ programme.
+
+```{r fig2_volcano, fig.width=5, fig.height=4.5}
+volc = rna_res %>% filter(gene_biotype == "protein_coding") %>%
+    mutate(lpadj = -log10(.data[[paste0("padj.", contrast)]]),
+           lfc   = .data[[paste0("log2FoldChange.", contrast)]])
+mark = volc %>% filter(gene_name %in% c("Tigd4", "Col22a1"))
+
+gv = ggplot(volc, aes(lfc, lpadj)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(volc, .data[[diff_col]] == "Down"),
+               color = "#8CC6E8", size = 0.9) +
+    geom_point(data = mark, color = "#E88C8C", size = 1.8) +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = mark, aes(label = gene_name), size = 3,
+                    min.segment.length = 0, max.overlaps = Inf) +
+    labs(x = "log2 Tigd4 / CK8", y = "-log10 padj") +
+    globals$theme
+print(gv)
+ggsave(file.path(outpath, DateNamer("volcano_Tigd4_vs_CK8.pdf")), gv, width = 5, height = 4.5)
+```
+
+*Input:* bulk RNA-seq DE (Tigd4 vs CK8), protein-coding genes.
+*Method:* x = log2FC, y = −log10 padj; the down set (`diff == "Down"`, `lfc_cut = 0.5`) is
+highlighted light blue; Tigd4/Col22a1 are drawn in red and text-labelled; dashed lines mark
+log2FC = ±0.5 and padj = 0.05.
+*Shows:* only a handful of genes are down in MTJ, while the canonical MTJ markers
+(Tigd4/Col22a1) sit on the up side — the down programme is small.
+
+## Figure 3 — Volcano: down-regulated translatome (Ribo MTJ/CK8, relaxed −0.5) `(canvas: 022)`
+
+*Why this figure:* the companion to Fig 2 on the **translational** axis — relocated from the
+retired report 06. Where Fig 2 shows genes transcriptionally down in MTJ (bulk RNA), this shows
+genes whose **translation** is down in MTJ nuclei vs CK8 myofibers (Ribo-seq MTJ/CK8) at the
+relaxed −0.5 cut, so the downregulated programme is captured in both modalities.
+
+```{r fig3_ribo_volcano, fig.width=6, fig.height=5}
+ribo = Riboseq_Differential_Expression()
+ribo_contrast = "MTJ_HA.Rpl22_CK8_HA.Rpl22"
+ribo_res = ribo$res %>% dplyr::rename(gene_id = id) %>%
+    left_join(annot, by = "gene_id") %>%
+    classify_DE(ribo_contrast, lfc_cut = 0.5)
+
+ribo_lfc_v  = paste0("log2FoldChange.", ribo_contrast)
+ribo_padj_v = paste0("padj.",           ribo_contrast)
+rvolc = ribo_res %>%
+    filter(!is.na(.data[[ribo_lfc_v]]), !is.na(.data[[ribo_padj_v]])) %>%
+    mutate(log2FC = .data[[ribo_lfc_v]], padj = .data[[ribo_padj_v]],
+           Down05 = log2FC < -0.5 & padj < 0.05)
+
+rdown05 = rvolc %>% filter(Down05) %>% arrange(log2FC)
+rlab    = head(rdown05, 25)
+# superset sanity check: the -0.5 down set must contain the stricter -0.75 set
+rdown075 = rvolc %>% filter(log2FC < -0.75 & padj < 0.05)
+stopifnot(all(rdown075$gene_id %in% rdown05$gene_id))
+
+gr = ggplot(rvolc, aes(log2FC, -log10(padj))) +
+    geom_point(data = dplyr::filter(rvolc, !Down05),
+               color = "lightgray", size = 0.6, alpha = 0.6) +
+    geom_point(data = dplyr::filter(rvolc, Down05),
+               color = "#8CC6E8", size = 0.8, alpha = 0.8) +   # match Fig 2 down colour (canvas 029)
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = rlab, aes(label = gene_name), size = 2.5,
+                    max.overlaps = Inf, min.segment.length = 0, segment.size = 0.2) +
+    labs(x = "log2 Ribo MTJ/CK8", y = "-log10 padj") +
+    globals$theme
+print(gr)
+ggsave(file.path(outpath, DateNamer("volcano_ribo_MTJ_CK8_down05.pdf")), gr, width = 6, height = 5)
+
+write.table(rdown05 %>% dplyr::select(gene_id, gene_name, log2FC, padj),
+    file = file.path(outpath, DateNamer("table_down05_ribo_MTJ_CK8.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* cached Ribo-seq DE for the MTJ/CK8 translatome contrast
+(`Riboseq_Differential_Expression()`, `MTJ_HA.Rpl22_CK8_HA.Rpl22`), mm39 symbols.
+*Method:* down called at the relaxed `log2FC < −0.5 & padj < 0.05`; down set coloured light blue
+(`#8CC6E8`, the same down colour as Figure 2) over grey; dashed lines at log2FC ±0.5 and padj 0.05;
+top-25 most-negative-log2FC genes labelled;
+`stopifnot` asserts the −0.5 set ⊇ the −0.75 set; down table exported.
+*Shows:* genes whose translation is most strongly reduced in MTJ nuclei vs CK8 — the
+translational counterpart to the transcriptional down set in Fig 2.
+
+## Figure 4 — GO BP on the Ribo-translatome down set `(canvas: 022)`
+
+*Why this figure:* functional characterisation of the translationally-down set (Fig 3),
+mirroring the GO done on the bulk-RNA down set — does down-regulated translation in MTJ
+concentrate in particular biological processes?
+
+```{r fig4_ribo_go, fig.width=8, fig.height=10}
+ribo_down_set = rdown05 %>% filter(gene_biotype == "protein_coding") %>% pull(gene_name) %>% unique()
+ribo_universe = ribo_res %>% filter(gene_biotype == "protein_coding") %>% pull(gene_name) %>% unique()
+cat(sprintf("GO inputs (canvas 048): %d genes (Ribo-translatome down set) vs universe %d (all tested protein-coding genes in the Ribo MTJ/CK8 DE).\n",
+            length(ribo_down_set), length(unique(ribo_universe))))
+
+if(length(ribo_down_set) >= 10){
+    go_ribo = run_GO(ribo_down_set, universe = ribo_universe, ont = "BP")
+    if(!is.null(go_ribo) && nrow(as.data.frame(go_ribo)) > 0){
+        p_ribo = enrichplot::dotplot(go_ribo, showCategory = 20) +
+            ggtitle("GO BP — down in MTJ translatome (Ribo MTJ/CK8, -0.5)")
+        print(p_ribo)
+        ggsave(file.path(outpath, DateNamer("dotplot_GO_BP_ribo_down.pdf")),
+               p_ribo, width = 8, height = 10)
+        write.table(as.data.frame(go_ribo),
+            file = file.path(outpath, DateNamer("table_GO_BP_ribo_down.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+    }
+} else {
+    cat("Fewer than 10 Ribo-translatome down genes — GO skipped.\n")
+}
+```
+
+*Input:* the Fig 3 Ribo-translatome down set (protein-coding); universe = all tested protein-coding
+genes in the Ribo MTJ/CK8 DE. The exact **gene count and universe size are printed above the figure**
+(canvas 048).
+*Method:* `run_GO()` (clusterProfiler enrichGO, BP), top-20 terms dotplot; table exported.
+*Shows:* the biological processes enriched among translationally-down MTJ genes.
+
+## Down gene list
+
+```{r}
+write.table(
+    down %>% dplyr::select(gene_id, gene_name, gene_biotype,
+                           baseMean,
+                           starts_with("log2FoldChange"),
+                           starts_with("padj"),
+                           starts_with("diff")),
+    file = file.path(outpath, DateNamer("table_down_in_MTJ.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE
+)
+```
+
+## Figure 5 — Heatmap of downregulated genes (bulk RNA)
+
+*Why this figure:* Confirms the down call is real and consistent across replicates, so the listed genes are genuinely lower in Tigd4 (MTJ) and not artefacts of a single sample.
+
+```{r fig2_down_heatmap, fig.width=5, fig.height=8}
+dat = rna$dat %>%
+    filter(gene_id %in% down$gene_id) %>%
+    dplyr::select(gene_name, contains("sample")) %>%
+    as.data.frame() %>%
+    magrittr::set_colnames(stringr::str_replace(colnames(.), "sample.", "")) %>%
+    magrittr::set_rownames(make.unique(.$gene_name)) %>%
+    dplyr::select(-gene_name)
+
+if(nrow(dat) >= 2){
+    mat = as.matrix(t(scale(t(log2(dat + 1)))))
+    h = Heatmap(mat, name = "z(log2 cnt)",
+                show_row_dend = FALSE, show_column_dend = FALSE,
+                row_names_gp = grid::gpar(fontsize = 7))
+    pdf(file.path(outpath, DateNamer("heatmap_down_in_MTJ.pdf")), width = 5, height = 8)
+    draw(h); dev.off()
+    draw(h)
+} else {
+    cat("Fewer than 2 down genes — heatmap skipped.\n")
+}
+```
+
+*Input:* the down-in-MTJ genes across the bulk RNA samples (CK8 ×4, Tigd4 ×3).
+*Method:* row z-scored `log2(count+1)` of the per-sample normalized counts from `rna$dat`.
+*Shows:* the down genes should read lower in the Tigd4 (MTJ) columns than the CK8 columns —
+a visual confirmation of the DE direction.
+
+## Figures 6-7 — GO enrichment on the bulk-RNA down set
+
+*Why this figure:* The reviewer explicitly asked for GO terms on the downregulated genes; this figure provides the functional characterisation of that down set, turning the bare gene list into the biological-process and cellular-component interpretation requested.
+
+```{r fig2_go_bp}
+go_universe_rna = rna_res %>% filter(gene_biotype == "protein_coding") %>% pull(gene_name) %>% unique()
+go_down_set_rna = rna_res %>% filter(.data[[diff_col]] == "Down", gene_biotype == "protein_coding") %>%
+    pull(gene_name) %>% unique()
+cat(sprintf("GO inputs (canvas 048): %d genes (bulk-RNA Down-in-MTJ set) vs universe %d (all tested protein-coding genes in the Tigd4/CK8 DE).\n",
+            length(go_down_set_rna), length(go_universe_rna)))
+
+go_bp = go_on_class(rna_res,
+                    diff_col = diff_col,
+                    class    = "Down",
+                    gene_col = "gene_name",
+                    universe = go_universe_rna,
+                    ont = "BP")
+
+if(!is.null(go_bp) && nrow(as.data.frame(go_bp)) > 0){
+    p_bp = enrichplot::dotplot(go_bp, showCategory = 20) +
+        ggtitle("GO BP — down in MTJ (Tigd4 vs CK8)")
+    print(p_bp)
+    ggsave(file.path(outpath, DateNamer("dotplot_GO_BP_down.pdf")),
+           p_bp, width = 8, height = 7)
+    write.table(as.data.frame(go_bp),
+        file = file.path(outpath, DateNamer("table_GO_BP_down.tsv")),
+        sep = "\t", quote = FALSE, row.names = FALSE)
+}
+```
+
+```{r fig3_go_cc}
+go_cc = go_on_class(rna_res,
+                    diff_col = diff_col,
+                    class    = "Down",
+                    gene_col = "gene_name",
+                    universe = go_universe_rna,   # same set as fig2_go_bp (canvas 048)
+                    ont = "CC")
+
+if(!is.null(go_cc) && nrow(as.data.frame(go_cc)) > 0){
+    p_cc = enrichplot::dotplot(go_cc, showCategory = 20) +
+        ggtitle("GO CC — down in MTJ (Tigd4 vs CK8)")
+    print(p_cc)
+    ggsave(file.path(outpath, DateNamer("dotplot_GO_CC_down.pdf")),
+           p_cc, width = 8, height = 7)
+    write.table(as.data.frame(go_cc),
+        file = file.path(outpath, DateNamer("table_GO_CC_down.tsv")),
+        sep = "\t", quote = FALSE, row.names = FALSE)
+}
+```
+
+*Input:* gene symbols from the Down class vs universe = all tested protein-coding genes (Tigd4/CK8
+DE). The **gene count and universe size are printed above the BP figure** (canvas 048).
+*Method:* `clusterProfiler::enrichGO` via `run_GO()` (cached), `OrgDb = org.Mm.eg.db`, BH-adjusted padj < 0.05, minGSSize = 10, maxGSSize = 500.
+*Shows:* biological processes (BP) and cellular components (CC) over-represented among the 37 (approx.) down-in-MTJ genes. The reviewer expects this as the main reply artefact.
+
+## Figure 8 — Volcano: all up & down genes labelled (Tigd4 vs CK8) `(canvas: 024)`
+
+*Why this figure:* the companion to the down-focused Figure 2 — it shows the **full
+bidirectional** bulk RNA-seq result and labels **every** significant up- and down-regulated gene
+(not just the down set / canonical markers), so the complete differentially expressed gene list
+is legible directly on the volcano. Because the up set (the MTJ-enriched programme) is large, this
+panel is a deliberate completeness artefact; Figure 9 is the readable, unlabelled companion.
+
+```{r fig8_volcano_updown_labeled, fig.width=8, fig.height=7}
+volc_ud = rna_res %>% filter(gene_biotype == "protein_coding") %>%
+    mutate(lfc   = .data[[paste0("log2FoldChange.", contrast)]],
+           lpadj = -log10(.data[[paste0("padj.", contrast)]]),
+           dir   = .data[[diff_col]])
+
+n_up   = sum(volc_ud$dir == "Up",   na.rm = TRUE)
+n_down = sum(volc_ud$dir == "Down", na.rm = TRUE)
+message("Up: ", n_up, "   Down: ", n_down)
+
+sig_ud = volc_ud %>% filter(dir %in% c("Up", "Down"))
+
+g_lab = ggplot(volc_ud, aes(lfc, lpadj)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(volc_ud, dir == "Up"),   color = "#E88C8C", size = 0.6) +
+    geom_point(data = dplyr::filter(volc_ud, dir == "Down"), color = "#8CC6E8", size = 0.6) +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = sig_ud, aes(label = gene_name), size = 2,
+                    min.segment.length = 0, max.overlaps = Inf, segment.size = 0.2) +
+    labs(x = "log2 Tigd4 / CK8", y = "-log10 padj") +
+    globals$theme
+print(g_lab)
+ggsave(file.path(outpath, DateNamer("volcano_Tigd4_CK8_updown_labeled.pdf")),
+       g_lab, width = 8, height = 7)
+```
+
+*Input:* bulk RNA-seq DE (Tigd4 vs CK8), protein-coding genes; up/down from `classify_DE`,
+`lfc_cut = 0.5`, `padj < 0.05`.
+*Method:* x = log2FC, y = −log10 padj; up red, down blue, ns light gray; dashed gates at
+log2FC = ±0.5 and padj = 0.05. **Every** up ∪ down gene is text-labelled (`max.overlaps = Inf`).
+*Shows:* the entire significant up- and down-regulated set named on one plot — `n_up` up vs
+`n_down` down (printed above); the up programme dominates, the down set is small (the reviewer's
+Q3 observation), seen here against the full DE landscape.
+
+## Figure 9 — Volcano: no gene annotation (Tigd4 vs CK8) `(canvas: 024)`
+
+*Why this figure:* the clean, annotation-free version of Figure 8 — same points, up/down
+colouring and significance gates, but no gene-name labels, so the overall shape of the DE
+distribution (fold-change spread, up/down balance, significance ceiling) is readable without the
+label clutter.
+
+```{r fig9_volcano_bare, fig.width=5, fig.height=4.5}
+g_bare = ggplot(volc_ud, aes(lfc, lpadj)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(volc_ud, dir == "Up"),   color = "#E88C8C", size = 0.6) +
+    geom_point(data = dplyr::filter(volc_ud, dir == "Down"), color = "#8CC6E8", size = 0.6) +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, linewidth = 0.25) +
+    labs(x = "log2 Tigd4 / CK8", y = "-log10 padj") +
+    globals$theme
+print(g_bare)
+ggsave(file.path(outpath, DateNamer("volcano_Tigd4_CK8_bare.pdf")),
+       g_bare, width = 5, height = 4.5)
+```
+
+*Input:* identical to Figure 8.
+*Method:* same volcano (up red / down blue / ns gray, ±0.5 & padj gates) with **no**
+`geom_text_repel` and no highlighted marker points — "without any gene annotation" = no labels,
+colours retained.
+*Shows:* the unobstructed DE distribution — the readable companion to the fully-labelled Figure 8.
+
+## Up- and down-regulated gene table (bulk RNA) `(canvas: 024)`
+
+```{r table_up_down_RNAseq}
+up_down = rna_res %>%
+    filter(gene_biotype == "protein_coding", .data[[diff_col]] %in% c("Up", "Down"))
+
+# oracle: the Down rows here must be the same gene set as the legacy down table
+stopifnot(setequal(
+    up_down %>% filter(.data[[diff_col]] == "Down") %>% pull(gene_id),
+    down$gene_id))
+# direction sanity: Tigd4/Col22a1 are MTJ markers -> positive log2FC in this Tigd4-numerator contrast
+mark_lfc = rna_res %>% filter(gene_name %in% c("Tigd4", "Col22a1")) %>%
+    pull(.data[[paste0("log2FoldChange.", contrast)]])
+stopifnot(all(mark_lfc > 0))
+
+write.table(
+    up_down %>% dplyr::select(gene_id, gene_name, gene_biotype, baseMean,
+                              starts_with("log2FoldChange"),
+                              starts_with("padj"),
+                              starts_with("diff")),
+    file = file.path(outpath, DateNamer("table_up_down_RNAseq.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* bulk RNA-seq DE (Tigd4 vs CK8), protein-coding genes with `diff != "No"` at
+`lfc_cut = 0.5`, `padj < 0.05`.
+*Method:* one combined table with a `diff.Tigd4_CK8` direction column (Up / Down); the legacy
+down-only `table_down_in_MTJ.tsv` is kept unchanged. Two assertions guard it: the Down rows must
+equal the legacy down set, and Tigd4/Col22a1 must be up-regulated.
+*Shows:* the explicit up and down RNAseq gene lists the reviewer asked for, in a single file.
+
+## Figure 10 — MA plot, unlabeled (Tigd4 vs CK8) `(canvas: 030)`
+
+*Why this figure:* the clean companion to Figure 1 — the same MA (down set highlighted, y=0 and
+−0.5 gates) without any gene-name labels, so the overall fold-change-vs-expression distribution
+is readable without the label clutter.
+
+```{r fig10_MA_bare, fig.width=5, fig.height=4}
+g_ma_bare = ggplot(plot_df,
+           aes(log10(base + 1), .data[[paste0("log2FoldChange.", contrast)]])) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(plot_df, .data[[diff_col]] == "Down"),
+               color = "#8CC6E8", size = 0.5) +
+    geom_hline(yintercept = 0, linewidth = 0.25) +
+    geom_hline(yintercept = -0.5, linetype = 2, linewidth = 0.25) +
+    labs(x = "log10 baseMean", y = "log2 Tigd4 / CK8") +
+    globals$theme
+print(g_ma_bare)
+ggsave(file.path(outpath, DateNamer("MA_Tigd4_vs_CK8_bare.pdf")),
+       g_ma_bare, width = 5, height = 4)
+```
+
+*Input:* identical to Figure 1 (bulk RNA-seq DE, protein-coding; down set at `lfc_cut = 0.5`).
+*Method:* the Figure-1 MA (x = `log10 baseMean`, y = `log2 Tigd4/CK8`; down set light blue; y=0 and
+−0.5 dashed gates) with **no** `geom_text_repel` labels.
+*Shows:* the unobstructed MA distribution — the readable companion to the all-down-labelled Figure 1.
+
+## Session info
+
+```{r}
+sessionInfo()
+```

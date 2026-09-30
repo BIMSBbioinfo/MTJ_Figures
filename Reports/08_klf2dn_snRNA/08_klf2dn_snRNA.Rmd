@@ -1,0 +1,870 @@
+---
+title: "08 — KLF2 dominant-negative effect on mouse muscle (snRNA-seq)"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Question.** Does an AAV-delivered KLF2 dominant-negative (KLF2-DN), injected into one hind leg while the
+> contralateral leg receives Cre only, change the **MTJ myonuclear fraction** across 4 mice with a paired
+> (within-mouse) design — and are the per-sample MTJ calls clean (doublets / ambient RNA)?
+
+<!--
+# Canvas:     Prompts/canvases/078_klf2dn-snrna-analysis.md
+# Purpose:    KLF2-DN snRNA analysis (8 libs = 4 mice x 2 legs); per-sample MTJ composition + QC
+# Inputs:     STARsolo GeneFull counts (Scripts/Bin/starsolo_count.sh) via load_klf2dn()/process_klf2dn_per_sample();
+#             custom reference w/ Cre + KLF2-DN contigs (Scripts/Bin/build_klf2dn_reference.sh)
+# Outputs:    Results/08_klf2dn_snRNA/<date>/*.pdf,*.tsv + this HTML
+# Upstream:   canvas 078; snRNA_Loaders.R::load_klf2dn / process_klf2dn_per_sample
+# Downstream: 00_Report
+
+MTJ = top-Tigd4 cluster, each sample clustered independently (Col22a1 = cross-check); Cre = QC only.
+Report refocused 2026-07-27 on per-sample MTJ composition + QC — the merged-object figures (old UMAP /
+Ttn / markers-by-condition) and the paired pseudobulk DE were REMOVED at user request. The DE (a clean
+negative: 0 sig genes, KLF2-DN vs Cre) and its code/table remain in git history + earlier dated outputs.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+options(future.globals.maxSize = 8 * 1024^3)   # per-sample Seurat/scDblFinder ops export >500MB default cap
+suppressPackageStartupMessages({
+    library(Seurat); library(SeuratObject)
+    library(dplyr); library(ggplot2); library(tidyr); library(patchwork)
+})
+source.lib("ScanLib.R")
+source.lib("Bacon.R")
+source.lib("Read_Annotation.R")
+source.pro("snRNA_Loaders.R")
+
+report_name = "08_klf2dn_snRNA"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+
+sn = load_klf2dn()                        # merged object — used only for the pre-filter QC panel (Fig 1)
+ps = process_klf2dn_per_sample()          # cached list of 8 per-sample Seurat objects (UMAP+clusters+doublets+ambient+MTJ)
+# per-sample header: condition + which cluster is MTJ + SoupX rho
+hdr = sapply(names(ps), function(nm){
+    o = ps[[nm]]; mc = unique(as.character(o$seurat_clusters)[o$mtj])[1]
+    rho = tryCatch(round(Misc(o, "soupx_rho"), 3), error = function(e) NA)
+    sprintf("%s — %s | MTJ=cl%s | SoupX rho=%s", nm, unique(o$condition), mc, rho)
+})
+```
+
+## Figure 1 — Per-sample QC (before the cut)
+
+*Input:* `Misc(sn, "pre_filter_qc")` — per-nucleus nCount/nFeature/%mito captured by `load_klf2dn()`
+**before** the QC filter. *Method:* violin per library, faceted by metric, with the applied cut lines
+(`nFeature 200–7000`, `%mt < 10`). *Shows:* the distributions the fixed cuts act on. (canvas 078)
+
+```{r fig1_qc, fig.width=10, fig.height=5}
+pqc = as.data.frame(Misc(sn, "pre_filter_qc")) %>%   # misc slot returns it as a bare list-of-columns
+    tidyr::pivot_longer(c(nCount_RNA, nFeature_RNA, percent.mt),
+                        names_to = "metric", values_to = "value")
+cuts = data.frame(metric = c("nFeature_RNA","nFeature_RNA","percent.mt"),
+                  y = c(200, 7000, 10))
+g1 = ggplot(pqc, aes(sample_id, value, fill = condition)) +
+    geom_violin(scale = "width", linewidth = 0.2) +
+    geom_hline(data = cuts, aes(yintercept = y), linetype = 2, linewidth = 0.3) +
+    facet_wrap(~ metric, scales = "free_y") +
+    labs(x = NULL, y = NULL, title = "Per-library QC (pre-filter); dashed = applied cuts") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(g1); ggsave(file.path(outpath, DateNamer("qc_per_sample_prefilter.pdf")), g1, width = 10, height = 5)
+```
+
+# Per-sample MTJ analysis
+
+MTJ is called **per sample**: each library is clustered independently (`process_klf2dn_per_sample()`, Seurat
+res 0.6) and the cluster with the highest **Tigd4⁺** fraction is the MTJ (Col22a1 is a cross-check; Cre is a
+transduction QC only — too sparse to gate on). Condition comes from the sample sheet (whole leg).
+
+**Were doublets and ambient RNA removed?** *No.* Upstream QC was STARsolo cell-calling (CellRanger2.2 knee)
+plus `nFeature 200–7000` and `percent.mt < 10`. The panels below **visualise** doublets and ambient RNA
+per sample (nothing is removed) so we can judge whether the MTJ clusters are contaminated: per-sample
+scDblFinder doublet score/class (cluster-aware) and SoupX per-cell ambient fraction (from the STARsolo RAW
+droplet matrix).
+
+*Contamination summary — is the MTJ cluster doublet/ambient-driven?* Ambient RNA is low everywhere and no
+higher in MTJ (so MTJ is not a soup artifact). Doublets, however, are **enriched in the MTJ cluster** —
+expected, and a known false-positive: MTJ is a genuine muscle–tendon *interface* population co-expressing
+both programs, so a doublet caller reads it as a myofiber×tendon doublet. Removing scDblFinder "doublets"
+would therefore preferentially strip real junctional nuclei — a reason NOT to blanket-remove here. (canvas 078)
+
+```{r persample_contam}
+contam = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]; m = o$mtj
+    data.frame(sample = nm, condition = unique(o$condition), n_mtj = sum(m),
+        dbl_pct = round(100*mean(o$doublet_class == "doublet"), 1),
+        dbl_pct_MTJ = round(100*mean(o$doublet_class[m] == "doublet"), 1),
+        amb_median = round(median(o$ambient_frac), 3),
+        amb_median_MTJ = round(median(o$ambient_frac[m]), 3),
+        soupx_rho = round(tryCatch(Misc(o, "soupx_rho"), error = function(e) NA_real_), 3))
+}))
+knitr::kable(contam, caption = paste("Per-sample doublet %/ambient overall vs within the MTJ cluster.",
+    "MTJ is doublet-enriched (interface cell type mis-called as myofiber×tendon doublet), not ambient-driven. (canvas 078)"))
+write.table(contam, file.path(outpath, DateNamer("table_persample_contamination.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 2 — Per-sample QC heatmap (samples × metrics; MTJ % row)
+
+*Input:* each per-sample object. *Method:* a per-sample QC summary as a heatmap — **columns = samples**
+(ordered by condition), **rows = metrics**: median nFeature_RNA, % scDblFinder doublets, mean SoupX ambient
+fraction, % Tigd4⁺, % Col22a1⁺; each metric row is **min-max scaled across samples** (viridis fill) with the
+**raw value printed** in each cell. A separate bottom row shows the **% MTJ nuclei per sample** on a
+**grey→red** scale (label = %MTJ and n MTJ). *Shows:* at a glance whether any library is a QC outlier (low
+depth, high doublet/ambient burden) and how the MTJ fraction tracks across samples and conditions. (canvas 078)
+
+```{r fig2_qc_heatmap, fig.width=9, fig.height=5}
+qc = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]; fe = FetchData(o, vars = c("Tigd4","Col22a1"))
+    data.frame(sample = nm, condition = unique(o$condition),
+        med_nFeature = median(o$nFeature_RNA),
+        pct_doublet  = round(100 * mean(o$doublet_class == "doublet"), 1),
+        mean_ambient = round(mean(o$ambient_frac), 3),
+        pct_Tigd4    = round(100 * mean(fe$Tigd4   > 0), 1),
+        pct_Col22a1  = round(100 * mean(fe$Col22a1 > 0), 1),
+        pct_mtj      = round(100 * mean(o$mtj), 2),
+        n_mtj        = sum(o$mtj))
+}))
+qc  = qc[order(qc$condition, qc$sample), ]; lev = qc$sample
+labs_map = c(med_nFeature = "median nFeature", pct_doublet = "% doublet",
+             mean_ambient = "mean ambient", pct_Tigd4 = "% Tigd4+", pct_Col22a1 = "% Col22a1+")
+long = tidyr::pivot_longer(qc[, c("sample", names(labs_map))], -sample,
+                           names_to = "metric", values_to = "value")
+long$label  = ifelse(long$metric == "med_nFeature", sprintf("%.0f", long$value),
+              ifelse(long$metric == "mean_ambient", sprintf("%.3f", long$value),
+                     sprintf("%.1f", long$value)))
+long = long %>% group_by(metric) %>%
+    mutate(scaled = (value - min(value)) / (max(value) - min(value) + 1e-9)) %>% ungroup()
+long$sample = factor(long$sample, levels = lev)
+long$metric = factor(labs_map[long$metric], levels = rev(unname(labs_map)))
+p_qc = ggplot(long, aes(sample, metric, fill = scaled)) +
+    geom_tile(color = "white") + geom_text(aes(label = label), size = 3) +
+    scale_fill_viridis_c(guide = "none") +
+    labs(x = NULL, y = NULL, title = "Per-sample QC (row min-max scaled; text = raw value)") +
+    globals$theme + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+mtjr = qc; mtjr$sample = factor(mtjr$sample, levels = lev); mtjr$row = "% MTJ"
+p_mtj = ggplot(mtjr, aes(sample, row, fill = pct_mtj)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f (n=%d)", pct_mtj, n_mtj)), size = 3) +
+    scale_fill_gradient(low = "grey90", high = "red", guide = "none") +
+    labs(x = NULL, y = NULL) +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+g2 = p_qc / p_mtj + patchwork::plot_layout(heights = c(5, 1.2))
+print(g2); ggsave(file.path(outpath, DateNamer("heatmap_per_sample_QC.pdf")), g2, width = 9, height = 5)
+write.table(qc, file.path(outpath, DateNamer("table_per_sample_QC.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 2b — Per-sample UMAP grid (sample × variable; MTJ marked)
+
+*Input:* each per-sample object `ps`. *Method:* a grid of small UMAPs — **columns = samples** (ordered by
+condition), **rows = variable**: joint clusters, Col22a1, Tigd4, Cre, KLF2-DN, and the **selected MTJ cluster**
+(grey→red = the top-Tigd4 MTJ cluster). Each column is that sample's own UMAP. Under the condition-specific
+references a Cre leg carries no KLF2-DN feature (and vice versa), so those cells are left blank. *Shows:*
+per library, where the MTJ markers concentrate, that the selected MTJ cluster is the Tigd4/Col22a1-high
+region, and that each leg's transgene marks a small cluster. (canvas 079)
+
+```{r fig2b_umap_grid_per_sample, fig.width=18, fig.height=13}
+samp2b = names(ps)[order(sapply(ps, function(o) unique(as.character(o$condition))), names(ps))]
+vars2b = c("clusters","Col22a1","Tigd4","Cre","KLF2-DN","MTJ")
+mk2b = function(o, v) {
+    if(v == "clusters") return(DimPlot(o, group.by = "seurat_clusters"))
+    if(v == "MTJ")      return(DimPlot(o, group.by = "mtj", order = TRUE,
+                                       cols = c(`FALSE` = "grey85", `TRUE` = "red")))
+    if(v %in% rownames(o)) return(FeaturePlot(o, v, order = TRUE))
+    ggplot(data.frame(x = 1, y = 1), aes(x, y)) + geom_blank()   # missing transgene -> blank cell
+}
+panels2b = list()
+for(vi in seq_along(vars2b)){
+    for(sj in seq_along(samp2b)){
+        o = ps[[samp2b[sj]]]
+        p = mk2b(o, vars2b[vi]) +
+            theme(legend.position = "none", axis.text = element_blank(), axis.ticks = element_blank(),
+                  axis.line = element_blank(), plot.title = element_text(hjust = 0.5, size = 10),
+                  axis.title.x = element_blank(), axis.title.y = element_text(size = 10)) +
+            ggtitle(if(vi == 1) samp2b[sj] else "") +
+            ylab(if(sj == 1) vars2b[vi] else "")
+        panels2b[[length(panels2b) + 1]] = p
+    }
+}
+g2b = patchwork::wrap_plots(panels2b, nrow = length(vars2b), ncol = length(samp2b))
+print(g2b); ggsave(file.path(outpath, DateNamer("heatmap_umap_per_sample_by_variable.pdf")),
+                   g2b, width = 18, height = 13)
+```
+
+## Figure 3 — Per-sample violins: cluster vs Tigd4 / Col22a1
+
+*Input:* per-sample objects. *Method:* violin of Tigd4 and Col22a1 log-norm expression across that sample's
+clusters. *Shows:* which cluster is the Tigd4/Col22a1-high MTJ cluster in each sample, and how cleanly it
+separates. One page per library. (canvas 078)
+
+```{r fig3_violin_markers, fig.width=12, fig.height=5}
+gg3 = lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    VlnPlot(o, features = c("Tigd4","Col22a1"), group.by = "seurat_clusters", pt.size = 0, ncol = 2) +
+        plot_annotation(title = hdr[[nm]])
+})
+for(g in gg3) print(g)
+pdf(file.path(outpath, DateNamer("violin_per_sample_markers.pdf")), width = 12, height = 5)
+for(g in gg3) print(g); invisible(dev.off())
+```
+
+## Figure 4 — % of nuclei expressing the transgene (Cre / KLF2-DN), per sample
+
+*Input:* per-sample objects, `transduction` metadata (per-cell UMI of the library's transgene — **Cre** in
+control legs, **KLF2-DN** in DN legs, from the condition-specific references). *Method:* one bar per sample,
+height = % of nuclei with transduction > 0 (≥1 transgene UMI); fill = which transgene the library carries;
+label = n positive nuclei. *Shows:* the transgene **detection rate** per library. Rates are low in absolute
+terms and KLF2-DN legs read lower than Cre legs — an intrinsic snRNA sensitivity limit (short, intronless,
+3′-captured transcript, verified by strand/multimapper/EM checks), so this is a **presence/absence detection**
+readout, not a transduction-efficiency measure; transgene⁻ does not imply un-transduced. (canvas 078)
+
+```{r fig4_bar_pct_transduced, fig.width=6, fig.height=4}
+pcttd = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    if(!"transduction" %in% colnames(o@meta.data)) return(NULL)
+    td = o$transduction
+    data.frame(sample = nm, mouse = unique(o$mouse), condition = unique(o$condition),
+        transgene = unique(o$transgene), n_pos = sum(td > 0), total_cells = ncol(o),
+        pct_expr = round(100*mean(td > 0), 2))
+}))
+pcttd$transgene = factor(pcttd$transgene, levels = c("Cre","KLF2-DN"))
+pcttd = pcttd[order(pcttd$transgene, pcttd$mouse), ]
+pcttd$sample = factor(pcttd$sample, levels = pcttd$sample)
+g4 = ggplot(pcttd, aes(sample, pct_expr, fill = transgene)) +
+    geom_col() + geom_text(aes(label = n_pos), vjust = -0.3, size = 3) +
+    labs(x = NULL, y = "% nuclei expressing transgene",
+         title = "Transgene detection rate per sample (label = n positive nuclei)") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(g4); ggsave(file.path(outpath, DateNamer("bar_pct_transduced_per_sample.pdf")), g4, width = 6, height = 4)
+write.table(pcttd, file.path(outpath, DateNamer("table_pct_transduced_per_sample.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Per-sample MTJ summary table
+
+*One row per sample:* condition, total (post-QC) cells, n MTJ nuclei, %MTJ, MTJ cluster id, and the
+**fraction of nuclei positive** for Tigd4 / Col22a1 / transduction (the library's transgene) **inside vs
+outside the MTJ cluster** (% expressing). Watch: Col22a1 and Tigd4 are strongly MTJ-enriched (in ≫ out), and
+transduction⁺ is also higher inside MTJ (the transduced population overlaps MTJ) though sparse. (canvas 078)
+
+```{r persample_summary_table}
+summ = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]; m = o$mtj
+    fe = FetchData(o, vars = c("transduction","Tigd4","Col22a1"))
+    mc = unique(as.character(o$seurat_clusters)[m])[1]
+    pin = function(x, sel) round(100*mean(x[sel] > 0), 1)   # % positive within the subset
+    data.frame(sample = nm, condition = unique(o$condition), transgene = unique(o$transgene),
+        total_cells = ncol(o), n_mtj = sum(m), pct_mtj = round(100*mean(m), 2), mtj_cluster = mc,
+        pct_Tigd4_in = pin(fe$Tigd4,m),     pct_Tigd4_out = pin(fe$Tigd4,!m),
+        pct_Col22a1_in = pin(fe$Col22a1,m), pct_Col22a1_out = pin(fe$Col22a1,!m),
+        pct_transd_in = pin(fe$transduction,m), pct_transd_out = pin(fe$transduction,!m))
+}))
+knitr::kable(summ,
+    caption = paste("Per-sample MTJ summary: n cells / n MTJ / %MTJ / MTJ cluster +",
+    "% Tigd4+/Col22a1+/transduction+ nuclei inside vs outside the MTJ cluster. (canvas 078)"))
+write.table(summ, file.path(outpath, DateNamer("table_persample_MTJ_summary.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+### Transgene detection per sample (condition-specific references)
+
+*After the condition-specific recount* (Cre legs → Cre-only reference, KLF2-DN legs → DN-only reference), each
+library's transgene is directly detectable. This table reports, per sample, which transgene contig it carries
+and how many nuclei are transgene⁺ — the KLF2-DN legs now show **KLF2-DN⁺ nuclei** (0 under the old combined
+reference, where the shared 3′ backbone multimapped away). Caveat: DN-leg KLF2-DN captures only the
+3′UTR-proximal reads (~⅓ of the Cre-leg capture efficiency), so the counts are a **detection/localisation**
+readout, not a cross-condition transduction-level comparison. (canvas 078)
+
+```{r transgene_detection}
+tgd = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    data.frame(sample = nm, condition = unique(o$condition), transgene = unique(o$transgene),
+        n_cells = ncol(o), n_transduced = sum(o$transduction > 0),
+        pct_transduced = round(100*mean(o$transduction > 0), 2),
+        n_transduced_MTJ = sum(o$transduction > 0 & o$mtj))
+}))
+knitr::kable(tgd, caption = "Transgene+ nuclei per sample (Cre in control legs, KLF2-DN in DN legs). (canvas 078)")
+write.table(tgd, file.path(outpath, DateNamer("table_transgene_detection.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 5 — Per-sample transduction UMAPs (Cre / KLF2-DN)
+
+*Input:* per-sample objects. *Method:* the **transduction** UMI (Cre in control legs, KLF2-DN in DN legs) on
+each sample's own UMAP (`order=TRUE`, so the few transgene⁺ nuclei plot on top). *Shows:* where the sparse
+transduction signal falls — whether transgene⁺ nuclei concentrate near the MTJ/Tigd4 cluster or scatter
+across myonuclei. (canvas 078)
+
+```{r fig5_transduction_umap, fig.width=16, fig.height=8}
+gg5 = lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    FeaturePlot(o, features = "transduction", order = TRUE) +
+        ggtitle(sprintf("%s — %s [%s+=%d]", nm, unique(o$condition), unique(o$transgene),
+                        sum(o$transduction > 0))) +
+        theme(plot.title = element_text(size = 9))
+})
+g5 = wrap_plots(gg5, ncol = 4)
+print(g5); ggsave(file.path(outpath, DateNamer("umap_per_sample_transduction.pdf")), g5, width = 16, height = 8)
+```
+
+## Figure 6 — Tigd4 / Col22a1 dot plots: MTJ × transduction groups, per sample
+
+*Input:* per-sample objects. *Method:* each sample's nuclei split into four groups — MTJ vs non-MTJ crossed
+with transduced⁺ vs transduced⁻ (the library's transgene: Cre in controls, KLF2-DN in DN legs) — and Tigd4 /
+Col22a1 shown as a dot plot (**size = % of nuclei expressing**, **colour = mean log-norm expression**).
+*Shows:* whether Tigd4/Col22a1 in the MTJ cluster differ between transduced and untransduced nuclei — a check
+that the MTJ call is a marker property, not a transduction artifact. NB: MTJ∩transduced⁺ groups are tiny
+(sparse transgene capture), so read those dots with the underlying n in mind. (canvas 078)
+
+```{r fig6_dotplot_mtj_transd, fig.width=12, fig.height=7}
+dl = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    fe = FetchData(o, vars = c("transduction","Tigd4","Col22a1"))
+    fe$group  = paste0(ifelse(o$mtj, "MTJ", "nonMTJ"), ifelse(fe$transduction > 0, "·tr+", "·tr-"))
+    fe$sample = nm
+    fe
+})) %>%
+    tidyr::pivot_longer(c(Tigd4, Col22a1), names_to = "gene", values_to = "expr") %>%
+    group_by(sample, gene, group) %>%
+    summarize(pct = 100*mean(expr > 0), mean_expr = mean(expr), n = n(), .groups = "drop")
+dl$group = factor(dl$group, levels = c("MTJ·tr+","MTJ·tr-","nonMTJ·tr+","nonMTJ·tr-"))
+g6 = ggplot(dl, aes(group, gene, size = pct, color = mean_expr)) +
+    geom_point() +
+    scale_size_continuous(range = c(0, 8), name = "% expressing") +
+    scale_color_viridis_c(name = "mean expr") +
+    facet_wrap(~ sample, ncol = 4) +
+    labs(x = NULL, y = NULL, title = "Tigd4/Col22a1 by MTJ × transduction group, per sample") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(g6); ggsave(file.path(outpath, DateNamer("dotplot_MTJ_transduction_markers.pdf")), g6, width = 12, height = 7)
+write.table(dl, file.path(outpath, DateNamer("table_dotplot_MTJ_transduction_markers.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 7 — % MTJ nuclei per sample
+
+*Input:* per-sample MTJ calls. *Method:* bar per sample, height = % of nuclei that are MTJ, coloured by
+condition (label = n MTJ nuclei). *Shows:* MTJ abundance per library. (canvas 078)
+
+```{r fig7_pct_mtj_bar, fig.width=6, fig.height=4}
+pctmtj = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    data.frame(sample = nm, mouse = unique(o$mouse), condition = unique(o$condition),
+        n_mtj = sum(o$mtj), total_cells = ncol(o), pct_mtj = round(100*mean(o$mtj), 2))
+}))
+pctmtj$condition = factor(pctmtj$condition, levels = c("Cre","KLF2-DN"))
+g7 = ggplot(pctmtj, aes(sample, pct_mtj, fill = condition)) +
+    geom_col() + geom_text(aes(label = n_mtj), vjust = -0.3, size = 3) +
+    labs(x = NULL, y = "% MTJ nuclei", title = "MTJ fraction per sample (label = n MTJ nuclei)") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(g7); ggsave(file.path(outpath, DateNamer("bar_pct_MTJ_per_sample.pdf")), g7, width = 6, height = 4)
+write.table(pctmtj, file.path(outpath, DateNamer("table_pct_MTJ_per_sample.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 8 — % MTJ, Cre vs KLF2-DN, paired within mouse
+
+*Input:* the per-sample %MTJ (Fig 7). *Method:* point plot, x = condition (Cre vs KLF2-DN), y = %MTJ, with a
+line connecting the two legs of each mouse (paired within-mouse design). A paired t-test on the 4 mouse pairs
+is shown. *Shows:* whether KLF2-DN changes the MTJ myonuclear fraction — the compositional analogue of the
+(removed) pseudobulk DE. NB: n = 4 pairs, so the test is low-powered. **Caveat: this p-value is NOT robust —
+it depends on the per-sample Louvain MTJ boundary. Under a cluster-robust integrated definition (Fig 15) the
+same trend is only p ≈ 0.17. Read this figure together with Fig 15; the significant p here is a clustering
+artifact.** (canvas 078)
+
+```{r fig8_pct_mtj_paired, fig.width=5, fig.height=5}
+wide = pctmtj %>% dplyr::select(mouse, condition, pct_mtj) %>%
+    tidyr::pivot_wider(names_from = condition, values_from = pct_mtj)
+pv = tryCatch(t.test(wide$`KLF2-DN`, wide$Cre, paired = TRUE)$p.value, error = function(e) NA_real_)
+g8 = ggplot(pctmtj, aes(condition, pct_mtj)) +
+    geom_line(aes(group = mouse), color = "grey60") +
+    geom_point(aes(color = condition), size = 3) +
+    geom_text(data = subset(pctmtj, condition == "KLF2-DN"), aes(label = mouse),
+              hjust = -0.4, size = 3.2) +
+    scale_x_discrete(expand = expansion(add = c(0.2, 0.7))) +
+    labs(x = NULL, y = "% MTJ nuclei",
+         title = "MTJ fraction: Cre vs KLF2-DN (paired by mouse)",
+         subtitle = sprintf("paired t-test p = %.2f (n = 4 mice)", pv)) +
+    globals$theme + theme(legend.position = "none")
+print(g8); ggsave(file.path(outpath, DateNamer("point_pct_MTJ_paired_condition.pdf")), g8, width = 5, height = 5)
+write.table(wide, file.path(outpath, DateNamer("table_pct_MTJ_paired.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 9 — Sensitivity: %MTJ excluding scDblFinder doublets (paired)
+
+*Input:* per-sample MTJ calls, restricted to scDblFinder **singlets**. *Method:* recompute %MTJ per sample
+as (MTJ singlets)/(all singlets), then the same paired Cre-vs-KLF2-DN point plot + paired t-test as Fig 8.
+*Shows:* whether the "%MTJ lower in KLF2-DN" trend is an artifact of doublet contamination. *Result:*
+excluding doublets shifts every sample's %MTJ down (MTJ is ~18% doublet-flagged — the interface-cell
+false-positive) but the **paired trend is unchanged** — still lower in KLF2-DN in all 4 mice, so doublets
+are not driving it. (canvas 078)
+
+```{r fig9_sensitivity_nodoublet, fig.width=5, fig.height=5}
+sens = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]; sg = o$doublet_class == "singlet"
+    data.frame(sample = nm, mouse = unique(o$mouse), condition = unique(o$condition),
+        pct_mtj_all = round(100*mean(o$mtj), 2),
+        pct_mtj_singlet = round(100*mean(o$mtj[sg]), 2),
+        n_singlet = sum(sg), n_mtj_singlet = sum(o$mtj & sg))
+}))
+sens$condition = factor(sens$condition, levels = c("Cre","KLF2-DN"))
+ws  = sens %>% dplyr::select(mouse, condition, pct_mtj_singlet) %>%
+    tidyr::pivot_wider(names_from = condition, values_from = pct_mtj_singlet)
+pvs = tryCatch(t.test(ws$`KLF2-DN`, ws$Cre, paired = TRUE)$p.value, error = function(e) NA_real_)
+g9 = ggplot(sens, aes(condition, pct_mtj_singlet)) +
+    geom_line(aes(group = mouse), color = "grey60") +
+    geom_point(aes(color = condition), size = 3) +
+    geom_text(data = subset(sens, condition == "KLF2-DN"), aes(label = mouse),
+              hjust = -0.4, size = 3.2) +
+    scale_x_discrete(expand = expansion(add = c(0.2, 0.7))) +
+    labs(x = NULL, y = "% MTJ nuclei (singlets only)",
+         title = "MTJ fraction, doublets excluded: Cre vs KLF2-DN",
+         subtitle = sprintf("paired t-test p = %.2f (n = 4 mice)", pvs)) +
+    globals$theme + theme(legend.position = "none")
+print(g9); ggsave(file.path(outpath, DateNamer("point_pct_MTJ_paired_noDoublet.pdf")), g9, width = 5, height = 5)
+knitr::kable(sens, caption = "Per-sample %MTJ: all nuclei vs singlets-only (scDblFinder doublets excluded). (canvas 078)")
+write.table(sens, file.path(outpath, DateNamer("table_pct_MTJ_sensitivity_noDoublet.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 10 — %MTJ vs nFeature filter threshold
+
+*Input:* per-sample MTJ calls. *Method:* re-apply increasingly strict `nFeature_RNA` floors (>200 baseline,
+>500, >1000, >2000; keeping the existing MTJ labels) and recompute %MTJ over the survivors — line per
+sample, coloured by condition. A per-threshold paired Cre-vs-KLF2-DN summary is tabled below. *Shows:*
+**%MTJ rises with the floor** — MTJ nuclei are higher-complexity than average (expected for a dual-program
+interface type). The Cre-vs-KLF2-DN "%MTJ lower in KLF2-DN" trend is **threshold-dependent**: present at
+>200/>500 (4/4 mice, p≈0.11–0.14) but gone by >1000 (3/4, p≈0.84). NB: TFLN152 (m1, KLF2-DN) has **no**
+nuclei above nFeature 2000, so the >2000 paired test drops m1. (canvas 078)
+
+```{r fig10_pct_mtj_by_nfeature, fig.width=7, fig.height=5}
+thr = c(200, 500, 1000, 2000)
+nfd = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]; nf = o$nFeature_RNA
+    dplyr::bind_rows(lapply(thr, function(t){ k = nf > t
+        data.frame(sample = nm, mouse = unique(o$mouse), condition = unique(o$condition),
+            nfeature_min = t, n_cells = sum(k), n_mtj = sum(o$mtj & k),
+            pct_mtj = if(sum(k) > 0) round(100*mean(o$mtj[k]), 2) else NA_real_)
+    }))
+}))
+nfd$condition = factor(nfd$condition, levels = c("Cre","KLF2-DN"))
+g10 = ggplot(nfd, aes(factor(nfeature_min), pct_mtj, group = sample, color = condition)) +
+    geom_line() + geom_point(size = 2) +
+    labs(x = "nFeature_RNA minimum", y = "% MTJ nuclei",
+         title = "MTJ fraction vs nFeature filter (per sample)") +
+    globals$theme
+print(g10); ggsave(file.path(outpath, DateNamer("line_pct_MTJ_by_nFeature.pdf")), g10, width = 7, height = 5)
+
+# per-threshold paired Cre-vs-KLF2-DN summary
+paired_thr = dplyr::bind_rows(lapply(thr, function(t){
+    w = nfd %>% filter(nfeature_min == t) %>% dplyr::select(mouse, condition, pct_mtj) %>%
+        tidyr::pivot_wider(names_from = condition, values_from = pct_mtj)
+    ok = complete.cases(w[, c("Cre","KLF2-DN")])
+    data.frame(nfeature_min = t, n_pairs = sum(ok),
+        mean_Cre = round(mean(w$Cre[ok]), 2), mean_KLF2DN = round(mean(w$`KLF2-DN`[ok]), 2),
+        n_down = sum(w$`KLF2-DN`[ok] < w$Cre[ok]),
+        paired_t_p = round(tryCatch(t.test(w$`KLF2-DN`[ok], w$Cre[ok], paired = TRUE)$p.value,
+                                    error = function(e) NA_real_), 3))
+}))
+knitr::kable(paired_thr, caption = "Per-threshold paired Cre-vs-KLF2-DN %MTJ (n_pairs, mean, n mice down, paired t p). (canvas 078)")
+write.table(nfd, file.path(outpath, DateNamer("table_pct_MTJ_by_nFeature.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 11 — % transgene⁺ cells per cluster, per sample (heatmaps)
+
+*Input:* per-sample objects. *Method:* for each (sample × per-sample cluster), the % of nuclei positive for
+the library's transgene — **Cre** (control legs, left) and **KLF2-DN** (DN legs, right), from the
+condition-specific references. Each sample was clustered independently so cluster ids are per-sample; the
+MTJ (top-Tigd4) cluster is marked with a dot. *Shows:* the transgene signal concentrates in the MTJ cluster
+in nearly every sample. (canvas 078)
+
+```{r fig11_transgene_heatmap, fig.width=14, fig.height=5}
+hm = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]
+    data.frame(sample = nm, transgene = unique(o$transgene),
+               cluster = as.character(o$seurat_clusters),
+               pos = o$transduction > 0, mtj = o$mtj)
+})) %>%
+    group_by(sample, transgene, cluster) %>%
+    summarize(pct_pos = 100*mean(pos), is_mtj = any(mtj), n = n(), .groups = "drop") %>%
+    mutate(cluster = factor(cluster, levels = as.character(sort(unique(as.integer(cluster))))))
+
+heat = function(tg, title){
+    d = dplyr::filter(hm, transgene == tg)
+    ggplot(d, aes(cluster, sample, fill = pct_pos)) +
+        geom_tile(color = "grey90") +
+        geom_point(data = dplyr::filter(d, is_mtj), shape = 21, fill = NA, color = "black", size = 3, stroke = 1) +
+        scale_fill_viridis_c(name = "% +", limits = c(0, max(hm$pct_pos))) +
+        labs(x = "per-sample cluster", y = NULL, title = title) +
+        globals$theme
+}
+g11 = heat("Cre", "% Cre+ per cluster (control legs)") +
+      heat("KLF2-DN", "% KLF2-DN+ per cluster (DN legs); ○ = MTJ cluster")
+print(g11); ggsave(file.path(outpath, DateNamer("heatmap_transgene_pct_by_cluster.pdf")), g11, width = 14, height = 5)
+write.table(hm, file.path(outpath, DateNamer("table_transgene_pct_by_cluster.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 12 — % of MTJ nuclei that are transgene⁺, per sample
+
+*Input:* per-sample MTJ nuclei. *Method:* bar per sample = % of that sample's MTJ nuclei positive for its
+transgene — **Cre⁺** in control legs, **KLF2-DN⁺** in DN legs (label = n transgene⁺ MTJ nuclei / n MTJ).
+*Shows:* what fraction of the MTJ population carries a detectable transgene UMI. NB capture efficiency differs
+between the Cre-leg (full plasmid) and DN-leg (3′UTR-only) references, so compare within-transgene, not
+Cre-vs-KLF2-DN levels directly. (canvas 078)
+
+```{r fig12_pct_mtj_transgene_pos, fig.width=6, fig.height=4}
+bmt = dplyr::bind_rows(lapply(names(ps), function(nm){
+    o = ps[[nm]]; m = o$mtj
+    data.frame(sample = nm, condition = unique(o$condition), transgene = unique(o$transgene),
+        n_mtj = sum(m), n_pos = sum(o$transduction[m] > 0),
+        pct_mtj_transgene_pos = round(100*mean(o$transduction[m] > 0), 1))
+}))
+g12 = ggplot(bmt, aes(sample, pct_mtj_transgene_pos, fill = transgene)) +
+    geom_col() +
+    geom_text(aes(label = sprintf("%d/%d", n_pos, n_mtj)), vjust = -0.3, size = 2.8) +
+    labs(x = NULL, y = "% of MTJ nuclei transgene+",
+         title = "Transgene+ fraction of MTJ nuclei (Cre in controls, KLF2-DN in DN legs)") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(g12); ggsave(file.path(outpath, DateNamer("bar_pct_MTJ_transgene_pos.pdf")), g12, width = 6, height = 4)
+write.table(bmt, file.path(outpath, DateNamer("table_pct_MTJ_transgene_pos.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+# Alternative MTJ definition — Kim signature module score + integrated clustering
+
+The per-sample MTJ call (top-Tigd4 cluster, each library clustered independently) is sensitive to Louvain
+boundaries — the reason %MTJ shifted between recounts. Here we cross-check it two dropout/cluster-robust ways:
+a **Kim 2020 MTJ signature module score** (aggregate of the top Kim-atlas MTJ markers, so single-gene dropout
+matters less), and a **single joint clustering** of all 8 libraries integrated across samples (Seurat-native
+RPCA), where the MTJ population is defined once rather than per library.
+
+## Figure 13 — Kim MTJ module score vs cluster, per sample
+
+*Input:* per-sample objects; `kim_mtj_signature()` gene set (top markers of the Kim 2020 atlas MTJ cluster).
+*Method:* `AddModuleScore` of that gene set per nucleus, then a violin of the score across that sample's
+clusters. *Shows:* whether the same cluster the top-Tigd4 rule picks (in the title) is also the module-score
+peak — i.e. whether the MTJ call is robust to using a whole signature instead of one gene. One page per
+library. (canvas 078)
+
+```{r fig13_module_score_persample, fig.width=10, fig.height=4}
+sig   = kim_mtj_signature()$gene_name
+ps_sc = lapply(ps, kim_mtj_module_score, sig = sig)
+gg13 = lapply(names(ps_sc), function(nm){
+    o = ps_sc[[nm]]
+    VlnPlot(o, features = "kimMTJ1", group.by = "seurat_clusters", pt.size = 0) +
+        ggtitle(hdr[[nm]]) + theme(legend.position = "none")
+})
+for(g in gg13) print(g)
+pdf(file.path(outpath, DateNamer("violin_kimMTJ_score_per_sample.pdf")), width = 10, height = 4)
+for(g in gg13) print(g); invisible(dev.off())
+```
+
+## Figure 13b — MTJ-score threshold sweep (min-max scaled): %MTJ, Cre vs KLF2-DN
+
+*Input:* the per-sample Kim MTJ module score `kimMTJ1` (Fig 13), **restricted to scDblFinder singlets**
+(doublets removed — MTJ is doublet-enriched as an interface cell type, see Fig 9). *Method:* within each
+sample, over singlets only, the score is **min-max scaled to [0, 1]** (`(s − min)/(max − min)`), then swept
+over thresholds **0.3 … 0.9 in 0.05 steps** (the 0.1/0.2 rungs are dropped — they just capture the bulk of
+nuclei and the two conditions are tied there); at each threshold the "%MTJ" = % of that sample's singlets with
+scaled score **above** the threshold. **(a)** one **box-plot per threshold** — Cre vs KLF2-DN, a line per mouse
+(pairing), points = the 4 samples, **y-axis free per facet** (so high thresholds aren't squished by the low
+ones), with a **paired-t significance star** per threshold (Cre vs KLF2-DN across the 4 mice: `***`<0.001,
+`**`<0.01, `*`<0.05, `.`<0.1, else `ns`); **(b)** the **line-plot of median %MTJ per condition vs threshold**,
+error bars = interquartile range (Q25–Q75) across the 4 mice. *Shows:* how the score-defined MTJ fraction
+shrinks as the threshold rises and whether the Cre-vs-KLF2-DN gap is threshold-robust after doublet removal. NB
+min-max is recomputed on the singlet score range, so scaling stretches the upper tail; high thresholds select
+the score's top tail, not a fixed % of cells; with n=4 the paired-t stars are under-powered — read them as a
+trend indicator, not a calibrated test. (canvas 079)
+
+```{r fig13b_score_threshold_sweep, fig.width=14, fig.height=7}
+thr = seq(0.3, 0.9, by = 0.05)
+sweep = dplyr::bind_rows(lapply(names(ps_sc), function(nm){
+    o = ps_sc[[nm]]
+    sg = o$doublet_class == "singlet"                        # doublets removed (MTJ is doublet-enriched)
+    s = o$kimMTJ1[sg]
+    scaled = (s - min(s)) / (max(s) - min(s))                # per-sample min-max to [0,1] over singlets
+    data.frame(sample = nm, mouse = unique(o$mouse), condition = unique(o$condition),
+               threshold = thr, pct = sapply(thr, function(t) round(100 * mean(scaled > t), 2)))
+}))
+sweep$condition = factor(sweep$condition, levels = c("Cre","KLF2-DN"))
+med = sweep %>% group_by(condition, threshold) %>%
+    summarize(median_pct = round(median(pct), 2),
+              q25 = round(quantile(pct, 0.25), 2),
+              q75 = round(quantile(pct, 0.75), 2), .groups = "drop")
+
+# paired Cre-vs-KLF2-DN t-test per threshold -> p-value + significance star
+p2star = function(p) if(is.na(p)) "ns" else if(p<0.001) "***" else if(p<0.01) "**" else
+                     if(p<0.05) "*" else if(p<0.1) "." else "ns"
+stars = dplyr::bind_rows(lapply(split(sweep, sweep$threshold), function(df){
+    cre = df$pct[df$condition == "Cre"][order(df$mouse[df$condition == "Cre"])]
+    klf = df$pct[df$condition == "KLF2-DN"][order(df$mouse[df$condition == "KLF2-DN"])]
+    p   = tryCatch(t.test(cre, klf, paired = TRUE)$p.value, error = function(e) NA_real_)
+    data.frame(threshold = df$threshold[1], p = p, star = p2star(p),
+               lab  = if(is.na(p)) "ns" else sprintf("p=%.3f\n%s", p, p2star(p)),
+               y    = max(df$pct) * 1.15)
+}))
+# line-plot star position: above the higher condition's Q75 at each threshold
+stars_b = merge(stars, med %>% group_by(threshold) %>%
+                summarize(top = max(q75), .groups = "drop"), by = "threshold")
+stars_b$yb = stars_b$top * 1.10
+
+g13b_a = ggplot(sweep, aes(condition, pct)) +
+    geom_boxplot(aes(fill = condition), width = 0.55, alpha = 0.35, outlier.shape = NA) +
+    geom_line(aes(group = mouse), color = "grey60") +
+    geom_point(aes(color = condition), size = 2) +
+    geom_text(data = stars, aes(x = 1.5, y = y, label = lab), inherit.aes = FALSE,
+              size = 3.1, lineheight = 0.85) +
+    facet_wrap(~ threshold, nrow = 2, scales = "free_y",
+               labeller = labeller(threshold = function(x) paste0("scaled > ", x))) +
+    labs(x = NULL, y = "% singlets above threshold",
+         title = "Per-sample %MTJ by scaled Kim-score threshold, singlets only (Cre vs KLF2-DN; box + paired t p-value)") +
+    globals$theme + theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+g13b_b = ggplot(med, aes(threshold, median_pct, color = condition)) +
+    geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.01, linewidth = 0.4,
+                  position = position_dodge(width = 0.015)) +
+    geom_line(position = position_dodge(width = 0.015)) +
+    geom_point(size = 2, position = position_dodge(width = 0.015)) +
+    geom_text(data = stars_b, aes(x = threshold, y = yb, label = star), inherit.aes = FALSE, size = 7) +
+    scale_x_continuous(breaks = thr) +
+    labs(x = "scaled Kim MTJ score threshold", y = "median % singlets above threshold (bars = IQR)",
+         title = "Median %MTJ per condition vs score threshold (singlets only; paired-t star)") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(g13b_a); print(g13b_b)
+ggsave(file.path(outpath, DateNamer("dotplot_MTJscore_threshold_sweep.pdf")), g13b_a, width = 14, height = 7)
+ggsave(file.path(outpath, DateNamer("line_MTJscore_threshold_median.pdf")),   g13b_b, width = 8,  height = 4)
+write.table(sweep, file.path(outpath, DateNamer("table_MTJscore_threshold_sweep.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 14 — Integrated (RPCA) analysis: joint clusters, MTJ score, markers
+
+*Input:* all 8 per-sample objects merged and integrated across `sample_id` with Seurat-native RPCA
+(`integrate_klf2dn()`), clustered once at res 0.6. *Method:* UMAP on the integrated embedding, coloured by
+joint cluster, an **MTJ-cluster indicator** (grey→red: red = the integrated MTJ cluster), Kim MTJ module
+score, condition, sample, Tigd4 / Col22a1, and **Cre / KLF2-DN transgene amount** (log-norm expression; each
+transgene is non-zero only in its own leg type — Cre in control legs, KLF2-DN in DN legs — and is sparse per
+the snRNA capture limit, canvas 078). The **integrated MTJ cluster** is the joint cluster with the highest mean
+module score. *Shows:* that samples co-embed (integration worked), that one coherent joint cluster — the red
+MTJ indicator — carries the MTJ signature + Tigd4/Col22a1, and where the two transgenes localise on the shared
+map. (canvas 078)
+
+```{r fig14_integrated_umap, fig.width=15, fig.height=12}
+mi     = integrate_klf2dn()
+mtj_cl = Misc(mi, "mtj_int_cluster")
+p_cl  = DimPlot(mi, group.by = "seurat_clusters", label = TRUE) +
+        ggtitle(sprintf("integrated clusters (MTJ = cl%s)", mtj_cl)) + theme(legend.position = "none")
+p_mtj = DimPlot(mi, group.by = "mtj_int", order = TRUE,
+                cols = c(`FALSE` = "grey85", `TRUE` = "red")) +
+        ggtitle(sprintf("MTJ cluster cl%s (red)", mtj_cl)) + theme(legend.position = "none")
+p_sco = FeaturePlot(mi, "kimMTJ1") + ggtitle("Kim MTJ module score")
+p_cnd = DimPlot(mi, group.by = "condition") + ggtitle("condition")
+p_smp = DimPlot(mi, group.by = "sample_id") + ggtitle("sample")
+p_tig = FeaturePlot(mi, "Tigd4")   + ggtitle("Tigd4")
+p_col = FeaturePlot(mi, "Col22a1") + ggtitle("Col22a1")
+p_cre = FeaturePlot(mi, "Cre", order = TRUE)     + ggtitle("Cre (log-norm)")
+p_klf = FeaturePlot(mi, "KLF2-DN", order = TRUE) + ggtitle("KLF2-DN (log-norm)")
+g14 = (p_cl | p_mtj | p_sco) / (p_cnd | p_smp | p_tig) / (p_col | p_cre | p_klf)
+print(g14); ggsave(file.path(outpath, DateNamer("umap_integrated_MTJ.pdf")), g14, width = 15, height = 12)
+```
+
+## Figure 15 — % MTJ nuclei per sample, integrated definition vs per-sample
+
+*Input:* the integrated object's MTJ membership (`mtj_int`) vs the per-sample top-Tigd4 call (`pctmtj`, Fig 7).
+*Method:* per sample, % of its nuclei in the integrated MTJ cluster; barplot (fill = condition) + a scatter of
+per-sample %MTJ vs integrated %MTJ, and the same paired Cre-vs-KLF2-DN t-test as Fig 8 recomputed on the
+integrated definition. *Shows:* how many MTJ nuclei the integrated definition recovers per sample, whether the
+two definitions agree, and — crucially — whether the "%MTJ lower in KLF2-DN" trend survives a cluster-robust
+MTJ call. *Result:* the two MTJ definitions **agree well** (Jaccard ≈ 0.85 on MTJ membership). Under the
+integrated definition the direction still holds (Cre ≥ KLF2-DN in all 4 mice, KLF2-DN never higher), but the
+effect roughly **halves** (mean paired diff 0.97 → 0.50) and the paired t-test is **not significant
+(p ≈ 0.17)**, versus p ≈ 0.019 for the per-sample call. The integrated call pulls **TFLN156 from 3.88 % down
+to 3.18 %** — the single sample whose per-sample Louvain boundary drove the low per-sample p-value. **So the
+per-sample p = 0.019 is a clustering artifact; the robust conclusion is a consistent trend toward lower %MTJ
+in KLF2-DN, not a statistically significant effect** (n = 4). (canvas 078)
+
+```{r fig15_pct_mtj_integrated, fig.width=12, fig.height=5}
+pint = mi@meta.data %>% group_by(sample_id, mouse, condition) %>%
+    summarize(n_mtj_int = sum(mtj_int), total_cells = dplyr::n(),
+              pct_mtj_int = round(100*mean(mtj_int), 2), .groups = "drop")
+pint$condition = factor(pint$condition, levels = c("Cre","KLF2-DN"))
+
+cmp = dplyr::left_join(pint, dplyr::select(pctmtj, sample, pct_mtj_persample = pct_mtj),
+                       by = c("sample_id" = "sample"))
+wide_i = pint %>% dplyr::select(mouse, condition, pct_mtj_int) %>%
+    tidyr::pivot_wider(names_from = condition, values_from = pct_mtj_int)
+pv_i = tryCatch(t.test(wide_i$`KLF2-DN`, wide_i$Cre, paired = TRUE)$p.value, error = function(e) NA_real_)
+
+g15a = ggplot(pint, aes(sample_id, pct_mtj_int, fill = condition)) +
+    geom_col() + geom_text(aes(label = n_mtj_int), vjust = -0.3, size = 3) +
+    labs(x = NULL, y = "% MTJ nuclei (integrated)",
+         title = "Integrated MTJ fraction per sample (label = n MTJ nuclei)") +
+    globals$theme + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+g15b = ggplot(cmp, aes(pct_mtj_persample, pct_mtj_int, color = condition)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+    geom_point(size = 3) + ggrepel::geom_text_repel(aes(label = mouse), size = 3) +
+    labs(x = "% MTJ (per-sample top-Tigd4)", y = "% MTJ (integrated)",
+         title = sprintf("per-sample vs integrated MTJ  (paired KLF2-DN vs Cre p = %.2f)", pv_i)) +
+    globals$theme
+g15 = g15a | g15b
+print(g15); ggsave(file.path(outpath, DateNamer("pct_MTJ_integrated_vs_persample.pdf")), g15, width = 12, height = 5)
+write.table(cmp, file.path(outpath, DateNamer("table_pct_MTJ_integrated_vs_persample.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 16 — % MTJ, Cre vs KLF2-DN, paired within mouse (integrated definition)
+
+*Input:* integrated %MTJ per sample (`pint`, Fig 15). *Method:* the same paired point plot as Fig 8 — x =
+condition, y = % MTJ nuclei (integrated MTJ cluster), a line per mouse connecting its two legs, paired
+Cre-vs-KLF2-DN t-test (n = 4). *Shows:* the Cre-vs-KLF2-DN MTJ-fraction contrast under the cluster-robust
+integrated definition — the direct, artifact-free counterpart of Fig 8. *Result:* direction holds (Cre ≥
+KLF2-DN in all 4 mice, KLF2-DN never higher) but the effect is **not significant (p ≈ 0.17)**, vs p ≈ 0.019
+for the per-sample call — confirming the per-sample significance was a clustering artifact. (canvas 078)
+
+```{r fig16_pct_mtj_int_paired, fig.width=5, fig.height=5}
+g16 = ggplot(pint, aes(condition, pct_mtj_int)) +
+    geom_line(aes(group = mouse), color = "grey60") +
+    geom_point(aes(color = condition), size = 3) +
+    geom_text(data = subset(pint, condition == "KLF2-DN"), aes(label = mouse),
+              hjust = -0.4, size = 3.2) +
+    scale_x_discrete(expand = expansion(add = c(0.2, 0.7))) +
+    labs(x = NULL, y = "% MTJ nuclei (integrated)",
+         title = "MTJ fraction (integrated def): Cre vs KLF2-DN (paired by mouse)",
+         subtitle = sprintf("paired t-test p = %.2f (n = 4 mice)", pv_i)) +
+    globals$theme + theme(legend.position = "none")
+print(g16); ggsave(file.path(outpath, DateNamer("point_pct_MTJ_int_paired_condition.pdf")), g16, width = 5, height = 5)
+```
+
+## Figure 17 — Per-mouse MTJ: # and % MTJ nuclei per leg
+
+*Input:* `mtj_per_mouse_integrated()` — for **each mouse**, its two contralateral legs are integrated on
+their own (RPCA) and clustered jointly, MTJ = the highest Kim-module-score joint cluster (so both legs of a
+mouse share one MTJ definition — the cleanest basis for the paired comparison, with no cross-mouse batch and
+no per-leg clustering wobble). *Method:* per leg (sample), the count of MTJ nuclei and the % of nuclei that
+are MTJ; two bar panels (n and %), one bar per leg, coloured by condition, faceted by mouse. *Shows:* the MTJ
+myonuclear burden of each leg under the within-mouse-integrated definition. (canvas 079)
+
+```{r fig17_permouse_mtj_bar, fig.width=10, fig.height=4}
+pmo = mtj_per_mouse_integrated()   # named list of per-mouse integrated objects (UMAP + mtj_mouse)
+pm  = dplyr::bind_rows(lapply(pmo, function(o)
+    o@meta.data %>% dplyr::group_by(sample_id, mouse, condition) %>%
+        dplyr::summarize(mtj_cluster = Misc(o, "mtj_cluster"), n_mtj = sum(mtj_mouse),
+                         total_cells = dplyr::n(), pct_mtj = round(100 * mean(mtj_mouse), 2),
+                         .groups = "drop")))
+pm$condition = factor(pm$condition, levels = c("Cre","KLF2-DN"))
+pm = pm[order(pm$mouse, pm$condition), ]
+pm$sample_id = factor(pm$sample_id, levels = pm$sample_id)
+bar_pm = function(y, ylab, lab) ggplot(pm, aes(sample_id, .data[[y]], fill = condition)) +
+    geom_col() + geom_text(aes(label = .data[[lab]]), vjust = -0.3, size = 3) +
+    facet_grid(~ mouse, scales = "free_x", space = "free_x") +
+    labs(x = NULL, y = ylab) + globals$theme +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+g17 = bar_pm("n_mtj", "# MTJ nuclei", "n_mtj") | bar_pm("pct_mtj", "% MTJ nuclei", "pct_mtj")
+print(g17); ggsave(file.path(outpath, DateNamer("bar_permouse_MTJ_n_pct.pdf")), g17, width = 10, height = 4)
+write.table(pm, file.path(outpath, DateNamer("table_permouse_MTJ.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Figure 18 — Per-mouse MTJ: % MTJ, Cre vs KLF2-DN, paired (dotplot)
+
+*Input:* the per-mouse %MTJ from Fig 17 (`pm`). *Method:* point plot (dotplot), x = condition, y = %MTJ, a
+line per mouse connecting its two legs, paired Cre-vs-KLF2-DN t-test (n = 4). *Shows:* the paired
+Cre-vs-KLF2-DN MTJ-fraction contrast under the **within-mouse-integrated** MTJ definition — the third
+definition alongside per-sample (Fig 8) and all-8-integrated (Fig 16). (canvas 079)
+
+```{r fig18_permouse_mtj_paired, fig.width=5, fig.height=5}
+wpm = pm %>% dplyr::select(mouse, condition, pct_mtj) %>%
+    tidyr::pivot_wider(names_from = condition, values_from = pct_mtj)
+pv_pm = tryCatch(t.test(wpm$`KLF2-DN`, wpm$Cre, paired = TRUE)$p.value, error = function(e) NA_real_)
+g18 = ggplot(pm, aes(condition, pct_mtj)) +
+    geom_line(aes(group = mouse), color = "grey60") +
+    geom_point(aes(color = condition), size = 3) +
+    geom_text(data = subset(pm, condition == "KLF2-DN"), aes(label = mouse), hjust = -0.4, size = 3.2) +
+    scale_x_discrete(expand = expansion(add = c(0.2, 0.7))) +
+    labs(x = NULL, y = "% MTJ nuclei (per-mouse integrated)",
+         title = "MTJ fraction (per-mouse def): Cre vs KLF2-DN (paired)",
+         subtitle = sprintf("paired t-test p = %.2f (n = 4 mice)", pv_pm)) +
+    globals$theme + theme(legend.position = "none")
+print(g18); ggsave(file.path(outpath, DateNamer("point_permouse_MTJ_paired_condition.pdf")), g18, width = 5, height = 5)
+```
+
+## Figure 19 — Per-mouse UMAP grid (mouse × variable; MTJ marked)
+
+*Input:* the per-mouse integrated objects `pmo` (`mtj_per_mouse_integrated()`, Fig 17) — each mouse on its
+own RPCA embedding. *Method:* a single grid of small UMAPs — **columns = mouse** (m1–m4), **rows = variable**:
+joint clusters, an **MTJ indicator** (grey→red = the per-mouse MTJ cluster), Tigd4, Col22a1, Cre, KLF2-DN.
+Note each column is that mouse's own embedding (coordinates are not shared across columns). *Shows:* that
+within each mouse the MTJ cluster is a coherent region co-expressing Tigd4/Col22a1, and that Cre lights up
+only the Cre-leg cells and KLF2-DN only the DN-leg cells. (canvas 079)
+
+```{r fig19_permouse_umap_grid, fig.width=13, fig.height=18}
+mice19 = names(pmo)
+vars19 = c("clusters","MTJ","Tigd4","Col22a1","Cre","KLF2-DN")
+panels19 = list()
+for(vi in seq_along(vars19)){
+    for(mj in seq_along(mice19)){
+        o = pmo[[mice19[mj]]]; v = vars19[vi]
+        p = if(v == "clusters")   DimPlot(o, group.by = "seurat_clusters")
+            else if(v == "MTJ")   DimPlot(o, group.by = "mtj_mouse", order = TRUE,
+                                          cols = c(`FALSE` = "grey85", `TRUE` = "red"))
+            else                  FeaturePlot(o, v, order = TRUE)
+        p = p + theme(legend.position = "none",
+                      axis.text = element_blank(), axis.ticks = element_blank(),
+                      axis.line = element_blank(),
+                      plot.title = element_text(hjust = 0.5, size = 11),
+                      axis.title.x = element_blank(),
+                      axis.title.y = element_text(size = 11)) +
+            ggtitle(if(vi == 1) mice19[mj] else "") +
+            ylab(if(mj == 1) v else "")
+        panels19[[length(panels19) + 1]] = p
+    }
+}
+g19 = patchwork::wrap_plots(panels19, nrow = length(vars19), ncol = length(mice19))
+print(g19); ggsave(file.path(outpath, DateNamer("heatmap_umap_permouse_mouse_by_variable.pdf")),
+                   g19, width = 13, height = 18)
+```
+
+## Figures 20–21 — Transgene⁺ vs transgene⁻ volcanoes (Cre legs / DN legs)
+
+*Input:* `transgene_pos_markers()` — pooled within condition (4 Cre legs / 4 DN legs), transgene⁺ =
+`transduction > 0`, `FindMarkers` (Wilcoxon, `logfc.threshold = 0.25`, `min.pct = 0.1`) ⁺ vs ⁻ (cached in
+Bin/ so it isn't recomputed each render). *Method:* volcano of `avg_log2FC` vs `-log10(p_val_adj)`, colouring
+`p_val_adj < 0.05 & |avg_log2FC| > 0.25`, top-15 labelled. **Confound (documented, not removed):** transgene⁺
+is sparse and MTJ/sequencing-depth-enriched (canvas 078), so these hits largely reflect MTJ identity + capture
+depth rather than a transgene program — each subtitle reports n⁺/n⁻ and the median `nFeature_RNA` of the two
+groups, and MTJ markers (Tigd4/Col22a1) among the hits are expected. (canvas 080)
+
+```{r fig2021_transgene_volcano, fig.width=7, fig.height=6}
+transgene_volcano = function(res, ttl, tag){
+    de = res$de
+    de$mlp = -log10(pmax(de$p_val_adj, 1e-300))
+    de$dir = ifelse(de$p_val_adj < 0.05 & de$avg_log2FC >  0.25, "up",
+             ifelse(de$p_val_adj < 0.05 & de$avg_log2FC < -0.25, "down", "ns"))
+    g = ggplot(de, aes(avg_log2FC, mlp, color = dir)) +
+        geom_point(size = 0.9) +
+        scale_color_manual(values = c(up = "#B2182B", down = "#2166AC", ns = "grey80"), guide = "none") +
+        ggrepel::geom_text_repel(data = head(de[order(de$p_val_adj), ], 15),
+                                 aes(label = gene), size = 3, max.overlaps = Inf) +
+        labs(x = "avg log2FC (transgene+ vs -)", y = "-log10 adj.p", title = ttl,
+             subtitle = sprintf("n+ = %d, n- = %d | median nFeature +/- = %d / %d",
+                                res$n_pos, res$n_neg, res$med_nf_pos, res$med_nf_neg)) +
+        globals$theme
+    ggsave(file.path(outpath, DateNamer(sprintf("volcano_%s_pos_vs_neg.pdf", tag))), g, width = 7, height = 6)
+    write.table(de, file.path(outpath, DateNamer(sprintf("table_%s_pos_vs_neg.tsv", tag))),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    g
+}
+print(transgene_volcano(transgene_pos_markers("cre"), "Cre+ vs Cre- (control legs)",    "cre"))
+print(transgene_volcano(transgene_pos_markers("dn"),  "KLF2-DN+ vs KLF2-DN- (DN legs)", "klf2dn"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

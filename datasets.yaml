@@ -1,0 +1,111 @@
+# Datasets required to reproduce the MKim_MTJ analysis.
+#
+# This bundle contains CODE + small processed tables only. The raw sequencing
+# data and the large / third-party reference datasets below are NOT included in
+# the Zenodo deposit (size and/or independent provenance). Obtain each from the
+# listed source and place it at the given path (relative to the project root)
+# before running the reports. Paths that begin with /data/local/ are absolute on
+# the original analysis host; the `bundled` flag marks what ships inside this
+# archive under Scripts/Zenodo/Data/.
+
+# ----------------------------------------------------------------------------
+# Bundled with this archive (Scripts/Zenodo/Data/)
+# ----------------------------------------------------------------------------
+bundled_documentation:
+  - id: lab_mtj_markers
+    path: Documentation/MTJ marker genes from our study.xlsx
+    source: this study (Kim & Franke)
+    bundled: true
+  - id: biorxiv_supplement
+    path: Documentation/kim-franke-biorxiv.xlsx
+    source: this study — bioRxiv supplement
+    bundled: true
+  - id: klf2dn_transgene_fastas
+    path: Documentation/KLF2_Construct/
+    source: this study — KLF2-DN + pAAV-CK8-Cre-NLS construct FASTAs
+    bundled: true
+  - id: sample_sheet
+    path: Documentation/sample_sheet.tsv
+    source: this study — Ribo-Tag / RNA-seq sample sheet
+    bundled: true
+  - id: sample_sheet_klf2dn
+    path: Documentation/sample_sheet_KLF2dn.tsv
+    source: this study — KLF2-DN snRNA sample sheet
+    bundled: true
+  - id: mm10_to_mm39_chain
+    path: Documentation/mm10ToMm39.over.chain.gz
+    source: UCSC liftOver chain (mm10 -> mm39)
+    bundled: true
+
+# ----------------------------------------------------------------------------
+# Raw in-house sequencing (NOT bundled — deposit accessions / processed dirs)
+# ----------------------------------------------------------------------------
+raw_sequencing:
+  - id: raw_riboseq_sedentary
+    path: /data/local/Projects/MKim_MTJ/Results/Processing/pigx-riboseq
+    source: this study — sedentary Ribo-Tag, processed with PiGx
+    bundled: false
+  - id: raw_riboseq_exercise
+    path: /data/local/Projects/MKim_MTJ/Results/Riboseq_Exercise/pigx-rnaseq
+    source: this study — exercise Ribo-Tag, processed with PiGx
+    bundled: false
+  - id: raw_rnaseq
+    path: /data/local/Projects/MKim_MTJ/Results/Processing/RNAseq/pigx-rnaseq
+    source: this study — bulk RNA-seq, processed with PiGx
+    bundled: false
+  - id: klf2dn_counts
+    path: /data/local/Projects/MKim_MTJ/Results/klf2dn_starsolo_counts/<lib>/Solo.out/GeneFull/filtered/
+    source: this study — KLF2-DN snRNA, custom STARsolo reference (see Bin/build_klf2dn_reference.sh, Bin/starsolo_count.sh)
+    bundled: false
+
+# ----------------------------------------------------------------------------
+# Published external single-cell/nucleus atlases (NOT bundled — public repos)
+# Placed under $LOCAL_PATH/MKim_MTJ/Data/external/snRNA/<subdir>/ ; see snRNA_Loaders.R
+# ----------------------------------------------------------------------------
+external_snrna_atlases:
+  - id: kim_birchmeier_2020
+    subdir: kim_birchmeier_2020_E-MTAB-8623
+    source: ArrayExpress E-MTAB-8623 (Kim et al. 2020)
+    bundled: false
+  - id: petrany_2020
+    subdir: petrany_2020_GSE147127
+    source: GEO GSE147127; CellRanger filtered_feature_bc_matrix.h5 from Synapse syn21676145 (needs Synapse account). GEO SoupX h5 lack gene names — use the Synapse CellRanger h5.
+    bundled: false
+  - id: demicheli_2020
+    subdir: demicheli_2020_GSE143437
+    source: GEO GSE143437 (De Micheli et al. 2020) — metadata + rawdata txt.gz
+    bundled: false
+  - id: iscience_2021
+    subdir: iscience_2021_GSE162307
+    source: GEO GSE162307 — per-GSM .loom (iScience 2021 mouse muscle/tendon atlas)
+    bundled: false
+  - id: dilbaz_2026
+    subdir: dilbaz_2026_proprietary
+    source: proprietary exercise snRNA (Dilbaz et al. 2026) — not publicly released
+    bundled: false
+
+# ----------------------------------------------------------------------------
+# Large third-party reference data used only by Bin/Read_Documentation.R
+# (NOT used by the numbered reports 00-08; not bundled — redistribute from source)
+# ----------------------------------------------------------------------------
+external_reference:
+  - id: postar3
+    path: Documentation/POSTAR3/
+    source: POSTAR3 RBP binding-site database (~684 MB) — http://111.198.139.65/
+    bundled: false
+  - id: rbp_tar
+    path: Documentation/RBP-Tar/
+    source: RBP-target annotation tables (~18 MB)
+    bundled: false
+  - id: tigd4_rip
+    path: Documentation/Tigd4_RIP/
+    source: this study — Tigd4 RIP tables (~13 MB)
+    bundled: false
+  - id: mass_spectrometry
+    path: Documentation/Mass_Spectrometry/
+    source: this study — mass-spec tables (~2 MB)
+    bundled: false
+  - id: documentation_rnaseq
+    path: Documentation/RNAseq/
+    source: this study — auxiliary RNAseq documentation tables (~12 MB)
+    bundled: false

@@ -1,0 +1,9 @@
+code	state	name	expected_cells
+TFLN151	Arrived	Control-1	10000					
+TFLN152	Arrived	KLF2DN-1	10000					
+TFLN153	Arrived	Control-2	10000					
+TFLN154	Arrived	KLF2DN-2	10000					
+TFLN155	Arrived	1R KLF2DN	10000					
+TFLN156	Arrived	1L Control	10000					
+TFLN189	Arrived	2R KLF2DN	10000					
+TFLN190	Arrived	2L Control	10000		

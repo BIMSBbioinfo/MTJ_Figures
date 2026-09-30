@@ -1,0 +1,447 @@
+---
+title: "04 — Exercise translational response classes"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Reviewer question — Q5.** Which gene classes change translationally with exercise? Are the genes that gain MTJ enrichment specifically after exercise a distinct functional category, or do they share the classification of constitutive MTJ-enriched markers? Characterise both the up and the down responses.
+>
+> **Purpose.** This report partitions the MTJ translational response into mutually-exclusive classes and isolates the exercise-specific ones — genes translationally up or down after exercise but not in the sedentary state — then runs GO to characterise their function and contrast it with constitutive MTJ enrichment.
+
+<!--
+# Canvas: Prompts/canvases/004_exercise-de.md
+Reviewer Q5: what gene classes are translationally up / down after exercise?
+Are the newly enriched genes sharing MTJ-enriched categories?
+
+Upstream:
+  Riboseq_Differential_Expression()           -> sedentary contrast
+  Differential_Expression_Exercise()          -> exercise contrast
+  Riboseq_Differential_Expression_Combination() -> EXE-vs-untreated swap
+  build_exercise_TE()  (Translation_Efficiency.R) -> Fig 7 sedentary-vs-trained TE
+Helpers : Scripts/Bin/Exercise_Classification.R (classify_exercise_response)
+          Scripts/Bin/GO_Enrichment.R          (run_GO)
+          Scripts/Bin/Sample_Sheet.R           (load_sample_sheet)
+          Scripts/Bin/Translation_Efficiency.R (build_exercise_TE)  [canvas 020]
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(ggrepel)
+    library(ComplexHeatmap)
+})
+source.lib("ScanLib.R")
+source.lib("Bacon.R")
+source.lib("Read_Annotation.R")
+source.pro("Differential_Expression.R")
+source.pro("DE_Reporting.R")
+source.pro("GO_Enrichment.R")
+source.pro("Exercise_Classification.R")
+source.pro("Sample_Sheet.R")             # load_sample_sheet (Fig 7 exercise TE)
+source.pro("Translation_Efficiency.R")   # build_exercise_TE (Fig 7 exercise TE)
+
+report_name = "04_exercise_DE"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+
+path_gtf = "/data/local/vfranke/Annotation/mm39/EnsemblGenes/Mus_musculus.GRCm39.113.chr.gtf"
+annot    = read_Gene_Annotation(path_gtf)
+```
+
+## Load cached DE outputs
+
+```{r}
+sed = Riboseq_Differential_Expression()
+exe = Differential_Expression_Exercise()
+cmb = Riboseq_Differential_Expression_Combination()
+
+sed_res = sed$res %>% dplyr::rename(gene_id = id)
+exe_res = exe$res %>% dplyr::rename(gene_id = id)
+cmb_res = cmb$res %>% dplyr::rename(gene_id = id)
+```
+
+## Figure 1 — EXE-vs-WT Ribo-seq volcano (MTJ/CK8 ratio)
+
+*Why this figure:* Establishes the exercise-state MTJ/CK8 translational contrast that defines "changes following exercise" in Q5; without this baseline of significant exercise-state hits there is no set to partition into response classes.
+
+```{r fig1_volcano, fig.width=4, fig.height=4}
+contrast_exe = "MTJ_HA_CK8_HA"
+plot_df = exe_res %>% left_join(annot, by = "gene_id") %>%
+    filter(gene_biotype == "protein_coding") %>%
+    classify_DE(contrast_exe) %>%
+    mutate(lpval = -log10(.data[[paste0("padj.", contrast_exe)]]))
+
+g1 = ggplot(plot_df,
+           aes(.data[[paste0("log2FoldChange.", contrast_exe)]], lpval)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(plot_df, .data[[paste0("diff.", contrast_exe)]] == "Up"),
+               color = "#E88C8C", size = 0.5) +
+    geom_point(data = dplyr::filter(plot_df, .data[[paste0("diff.", contrast_exe)]] == "Down"),
+               color = "#8CC6E8", size = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, linewidth = 0.25) +
+    geom_vline(xintercept = c(-0.75, 0.75), linetype = 2, linewidth = 0.25) +
+    labs(x = "log2 MTJ-HA / CK8-HA (exercise)", y = "-log10 padj") +
+    globals$theme
+print(g1)
+ggsave(file.path(outpath, DateNamer("volcano_exe_vs_wt.pdf")),
+       g1, width = 4, height = 4)
+```
+
+*Input:* `Differential_Expression_Exercise()` Ribo-seq contrast `MTJ_HA` vs `CK8_HA`.
+*Method:* DESeq2 Wald test, thresholds `|LFC|>0.75`, `padj<0.05`.
+*Shows:* MTJ-vs-CK8 enrichment after exercise. Compare with Phase 2 Figure 1 to see which shifts.
+
+## Figure 2 — Sedentary LFC vs exercise LFC
+
+*Why this figure:* Q5 hinges on separating newly exercise-enriched genes from constitutive MTJ markers; plotting sedentary against exercise enrichment is what operationally distinguishes "newly enriched" (off-diagonal) from "already enriched" genes and assigns each to a response class.
+
+```{r fig2_swap_scatter, fig.width=7, fig.height=5}
+cls = classify_exercise_response(
+    de_sedentary = sed$res %>% dplyr::rename(gene_id = id),
+    de_exercise  = exe$res %>% dplyr::rename(gene_id = id),
+    de_combined  = cmb$res %>% dplyr::rename(gene_id = id)
+) %>% left_join(annot, by = "gene_id")
+
+pc = cls %>% filter(gene_biotype == "protein_coding")
+
+# label set: the four named markers + top-15 exercise-specific genes
+# (EXE_only union, ranked by |exercise LFC|)
+exe_specific = pc %>%
+    filter(response_class %in% c("translationally_up_EXE_only",
+                                 "translationally_down_EXE_only")) %>%
+    arrange(desc(abs(log2FoldChange_MTJ_HA_CK8_HA))) %>% head(15)
+markers = pc %>% filter(gene_name %in% c("Tigd4","Col22a1","Klf2","Klf5"))
+lab_df  = dplyr::distinct(dplyr::bind_rows(exe_specific, markers))
+
+# shared response-class colour map (used by Figs 2 & 3, canvas 041): default hue_pal over the
+# sorted non-"unchanged" classes (= Fig 2's existing colours), "unchanged" = lightgray
+resp_levels = sort(setdiff(unique(cls$response_class), "unchanged"))
+class_cols  = setNames(scales::hue_pal()(length(resp_levels)), resp_levels)
+class_cols["unchanged"] = "lightgray"
+
+g2 = ggplot(mapping = aes(log2FoldChange_MTJ_HA.Rpl22_CK8_HA.Rpl22,
+                          log2FoldChange_MTJ_HA_CK8_HA)) +
+    geom_point(data = pc %>% filter(response_class == "unchanged"),
+               color = "lightgray", size = 0.5, alpha = 0.5) +
+    geom_point(data = pc %>% filter(response_class != "unchanged"),
+               aes(color = response_class), size = 0.5, alpha = 0.7) +
+    scale_color_manual(values = class_cols) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = 0, linewidth = 0.25) +
+    geom_vline(xintercept = 0, linewidth = 0.25) +
+    geom_text_repel(data = lab_df, aes(label = gene_name), size = 2.8,
+                    min.segment.length = 0, max.overlaps = Inf) +
+    labs(x = "log2 MTJ/CK8 sedentary", y = "log2 MTJ/CK8 exercise") +
+    globals$theme
+print(g2)
+ggsave(file.path(outpath, DateNamer("scatter_LFC_sedentary_vs_exercise.pdf")),
+       g2, width = 7, height = 5)
+```
+
+*Input:* joined sedentary + exercise + combined (swap) DE.
+*Method:* `classify_exercise_response()`: eight mutually-exclusive response classes. The
+`"unchanged"` class is drawn in light gray; responding classes coloured on top. Labels =
+Tigd4/Col22a1/Klf2/Klf5 + the top-15 exercise-specific genes (the two `*_EXE_only` classes,
+ranked by `|exercise LFC|`). Panel widened (`fig.width = 7`) so the x-spread is legible.
+*Shows:* genes that gain MTJ enrichment specifically under exercise (above diagonal, right side) vs constitutive markers vs losers.
+
+## Figure 3 — Class counts `(canvas: 041)`
+
+*Why this figure:* Quantifies how many genes fall into each response class, so the exercise-specific up/down sets carried into GO are shown to be large enough to be meaningful and to gauge whether the exercise response is dominated by gains, losses, or constitutive enrichment.
+
+```{r fig3_bar, fig.width=7, fig.height=3}
+cls_counts = cls %>% dplyr::count(response_class) %>% arrange(-n)
+g3 = ggplot(cls_counts, aes(reorder(response_class, n), n, fill = response_class)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = class_cols) +   # same per-class colours as Figure 2 (canvas 041)
+    globals$theme +
+    labs(x = NULL, y = "# genes")
+print(g3)
+ggsave(file.path(outpath, DateNamer("bar_exercise_response_class.pdf")),
+       g3, width = 7, height = 3)
+```
+
+*Input:* response-class assignment above.
+*Method:* `dplyr::count`; bars use the **shared `class_cols` palette** so each class matches its
+Figure 2 colour (`unchanged` = lightgray), canvas 041.
+*Shows:* size of each translational-response class; the reviewer asks whether `translationally_up_EXE_only` and `translationally_down_EXE_only` differ in function from constitutive MTJ markers.
+
+## Figure 4-5 — GO on EXE-only response classes `(canvas: 026, 038, 042, 048)`
+
+*Why this figure:* This is the direct answer to Q5's functional question — GO on the exercise-specific up and down sets tests whether translationally exercise-induced genes form a distinct functional category and whether the two responses ("each response") enrich different biology.
+
+*GO inputs (canvas 048):* for each class the **number of genes and the universe size are printed above
+the dotplots**; universe = protein-coding genes classified for exercise response in `cls`.
+
+```{r go_exe, fig.width=15, fig.height=11}
+universe = cls %>% filter(gene_biotype == "protein_coding") %>%
+    pull(gene_name) %>% unique()
+
+# per-gene exercise LFC, for ranking a GO term's top-5 genes (canvas 024 -> 026 -> 038)
+lfc_map = setNames(cls$log2FoldChange_MTJ_HA_CK8_HA, cls$gene_name)
+top5_genes = function(geneID){
+    gs = strsplit(geneID, "/")[[1]]
+    gs = gs[order(-abs(lfc_map[gs]))]          # strongest exercise responders first
+    paste(head(gs, 5), collapse = ", ")
+}
+
+go_keep = list()   # accumulate enriched terms per class for the pathway-gene table below
+
+for(cls_name in c("translationally_up_EXE_only","translationally_down_EXE_only")){
+    gene_set = cls %>% filter(response_class == cls_name) %>% pull(gene_name) %>% unique()
+    if(length(gene_set) < 10){
+        message("skipping GO for ", cls_name, ": only ", length(gene_set), " genes")
+        next
+    }
+    cat(sprintf("GO inputs (canvas 048) — %s: %d genes vs universe %d (protein-coding genes classified for exercise response in `cls`).\n",
+                cls_name, length(unique(gene_set)), length(unique(universe))))
+    go_res = run_GO(gene_symbols = gene_set, universe = universe, ont = "BP")
+    if(is.null(go_res) || nrow(as.data.frame(go_res)) == 0) next
+    go_keep[[cls_name]] = as.data.frame(go_res)
+
+    p = enrichplot::dotplot(go_res, showCategory = 20) +
+        ggtitle(paste0("GO BP — ", cls_name))
+    # truncate the p.adjust colourbar tick labels to 3 sig digits, in place (keeps the gradient) — canvas 042
+    ci = which(vapply(p$scales$scales,
+                      function(s) any(c("colour","color") %in% s$aesthetics), logical(1)))
+    if(length(ci)) p$scales$scales[[ci[1]]]$labels = function(x) formatC(x, format = "g", digits = 3)
+    # top-5 genes per displayed term (by |exercise LFC|) drawn OUTSIDE the panel; legend below (canvas 038, 042)
+    res_df = as.data.frame(go_res)
+    res_df$top5 = vapply(res_df$geneID, top5_genes, character(1))
+    pd = p$data
+    pd$top5 = res_df$top5[match(pd$Description, res_df$Description)]
+    xr = max(ggplot2::ggplot_build(p)$data[[1]]$x, na.rm = TRUE)
+    p = p + geom_text(data = pd, aes(x = xr * 1.12, y = Description, label = top5),
+                      hjust = 0, size = 4.6, inherit.aes = FALSE) +   # font (canvas 045)
+        # cap the panel x to the dots so the labels don't stretch the axis; they fall in the margin (canvas 045)
+        coord_cartesian(xlim = c(NA, xr * 1.05), clip = "off") +
+        theme(plot.margin = unit(c(5.5, 460, 5.5, 5.5), "pt"),
+              legend.position = "bottom", legend.box = "horizontal",
+              legend.text = element_text(angle = 45, hjust = 1))
+    print(p)
+    ggsave(file.path(outpath, DateNamer(paste0("dotplot_GO_", cls_name, ".pdf"))),
+           p, width = 15, height = 11)
+    write.table(as.data.frame(go_res),
+        file = file.path(outpath, DateNamer(paste0("table_GO_", cls_name, ".tsv"))),
+        sep = "\t", quote = FALSE, row.names = FALSE)
+}
+```
+
+## Figure 6 — Heatmap of `translationally_up_EXE_only`
+
+*Why this figure:* Resolves the GO summary down to individual exercise-induced genes and their per-sample expression, letting the reviewer verify the exercise-specific up class is a coherent, exercise-driven set rather than a noisy enrichment artefact.
+
+```{r fig6_heatmap, fig.width=6, fig.height=10}
+top_up_exe = cls %>%
+    filter(response_class == "translationally_up_EXE_only",
+           gene_biotype == "protein_coding") %>%
+    arrange(-log2FoldChange_MTJ_HA_CK8_HA) %>% head(50)
+
+if(nrow(top_up_exe) >= 5){
+    dat = cmb$dat %>%
+        filter(gene_id %in% top_up_exe$gene_id) %>%
+        dplyr::select(gene_name, contains("sample")) %>%
+        as.data.frame() %>%
+        magrittr::set_colnames(stringr::str_replace(colnames(.), "sample.", "")) %>%
+        magrittr::set_rownames(.$gene_name) %>%
+        dplyr::select(-gene_name)
+    mat = as.matrix(t(scale(t(log2(dat + 1)))))
+    h = Heatmap(mat, show_row_dend = FALSE, show_column_dend = FALSE,
+                name = "z(log2 cnt)")
+    pdf(file.path(outpath, DateNamer("heatmap_up_EXE_only.pdf")),
+        width = 6, height = 10)
+    draw(h)
+    dev.off()
+    draw(h)
+}
+```
+
+## Figure 7 — Exercise: sedentary vs trained translation efficiency `(canvas: 020)`
+
+*Why this figure:* the other figures partition the MTJ/CK8 enrichment contrast; this one asks the
+complementary question on the **translation-efficiency** axis — does training shift MTJ
+translation efficiency rather than transcript abundance? The exercise cohort has no matched bulk
+RNA, so the MTJ Ribo-seq of each condition is normalized by a matched MTJ snRNA-seq pseudobulk
+(dilbaz 2026); plotting sedentary vs trained TE shows the training-induced shift. (Relocated here
+from report 02.)
+
+```{r exercise_te}
+ss   = load_sample_sheet()
+exTE = build_exercise_TE(ss, path_gtf = path_gtf)
+
+# MTJ-label validation (oracle): the dilbaz MTJ nuclei must be Tigd4+/Col22a1+ vs other classes
+knitr::kable(exTE$mtj_validation, digits = 3,
+    caption = "dilbaz MTJ-label validation — mean normalized Tigd4/Col22a1 in MTJ vs other nuclei. MTJ must be clearly higher.")
+
+ex = exTE$te
+knitr::kable(ex %>% dplyr::count(te_class),
+    caption = "Genes by training-induced TE class (interaction padj < 0.05 & |Δlog2TE| > 0.75).")
+```
+
+```{r exercise_scatter, fig.width=5.5, fig.height=5}
+plot_df = ex %>% filter(detectable)
+markers_ex = plot_df %>% filter(gene_name %in% c("Tigd4","Col22a1","Klf2","Klf5"))
+top_lab    = plot_df %>% filter(significant) %>% arrange(desc(abs(delta_TE))) %>% head(15)
+lab_ex     = dplyr::distinct(dplyr::bind_rows(markers_ex, top_lab))
+
+g_ex = ggplot(plot_df, aes(log2TE_sedentary, log2TE_trained)) +
+    geom_point(color = "lightgray", size = 0.5) +
+    geom_point(data = dplyr::filter(plot_df, te_class == "TE_up_trained"),
+               color = "#E88C8C", size = 0.7) +
+    geom_point(data = dplyr::filter(plot_df, te_class == "TE_down_trained"),
+               color = "#8CC6E8", size = 0.7) +
+    geom_point(data = markers_ex, color = "#2CA02C", size = 2.2, shape = 18) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab_ex, aes(label = gene_name), size = 3,
+                    min.segment.length = 0, max.overlaps = 30) +
+    labs(x = "log2 TE  sedentary  (Ribo MTJ / dilbaz-MTJ snRNA)",
+         y = "log2 TE  trained  (Ribo MTJ / dilbaz-MTJ snRNA)") +
+    globals$theme
+print(g_ex)
+ggsave(file.path(outpath, DateNamer("scatter_TE_sedentary_vs_trained.pdf")),
+       g_ex, width = 5.5, height = 5)
+
+write.table(ex %>% dplyr::select(gene_name, log2TE_sedentary, log2TE_trained,
+                                 delta_TE, int_padj, te_class, significant),
+    file = file.path(outpath, DateNamer("table_exercise_TE.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* MTJ Ribo-seq — sedentary `riboseq_sedentary` MTJ_HA.Rpl22 (n=3), trained
+`riboseq_exercise` MTJ_HA (n=3) — and the dilbaz MTJ snRNA pseudobulk per condition×replicate,
+assembled by `build_exercise_TE()`.
+*Method:* one joint DESeq2 object over {Ribo,snRNA}×{sedentary,trained}, joint size factors;
+per-condition TE = mean(norm Ribo) / mean(norm snRNA pseudobulk). **x = sedentary log2(Ribo
+MTJ / dilbaz-MTJ snRNA), y = trained log2(Ribo MTJ / dilbaz-MTJ snRNA).** Red = higher TE when
+trained, blue = lower; Tigd4/Col22a1/Klf2/Klf5 marked as green diamonds; labels = those markers
++ the top-15 significant genes by |Δlog2TE|.
+*Caveat:* the two Ribo arms are different cohorts (batch ≡ condition) and the snRNA "Trained"
+protocol differs from the Ribo exercise protocol — a cross-protocol proxy used for ranking, not
+a calibrated FDR.
+*Shows:* genes off the diagonal change MTJ translation efficiency with training, separated from
+transcript-abundance change because both axes are snRNA-pseudobulk-normalized.
+
+## Figure 8 — Exercise fold-change of top cross-atlas MTJ markers (dilbaz) `(canvas: 044)`
+
+*Why this figure:* takes the genes most robustly MTJ-specific across two independent atlases (the
+top-25 of report 05's Kim×Petrany concordance, Fig 5) and asks how each responds to exercise in the
+native MTJ — i.e. whether the established MTJ markers are themselves up/down-regulated by training in
+the dilbaz snRNA data.
+
+```{r fig8_mtj_marker_exercise_fc, fig.width=6, fig.height=7}
+# newest report-05 cross-dataset MTJ table (data-provenance: latest dated, no hardcoded path) — canvas 044
+r05_dir = file.path(.scripts.path, "Results", "05_tigd4_specificity_snRNA")
+cands   = list.files(r05_dir, pattern = "table_crossdataset_MTJ_kim_vs_petrany\\.tsv$",
+                     recursive = TRUE, full.names = TRUE)
+stopifnot(length(cands) > 0)
+cross_tab = read.delim(sort(cands, decreasing = TRUE)[1], stringsAsFactors = FALSE)
+
+# top-25 MTJ markers by mean cross-atlas enrichment (kim+pet)/2
+top25 = cross_tab %>% arrange(desc(mtj_mean)) %>% head(25)
+
+# dilbaz exercise log2FC w.r.t. native (sedentary) MTJ snRNA: log2(trained / sedentary)
+fc = top25 %>%
+    left_join(ex %>% dplyr::select(gene_name, rna_sed, rna_tr), by = "gene_name") %>%
+    mutate(exercise_log2FC = log2((rna_tr + 1) / (rna_sed + 1)))
+n_missing = sum(is.na(fc$rna_sed))
+message("Fig8 top-25 MTJ markers: ", nrow(fc), " (missing in dilbaz ex: ", n_missing, ")")
+fc_plot = fc %>% filter(!is.na(exercise_log2FC))
+
+g8 = ggplot(fc_plot, aes(reorder(gene_name, exercise_log2FC), exercise_log2FC,
+                         fill = exercise_log2FC > 0)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c(`TRUE` = "#E88C8C", `FALSE` = "#8CC6E8"), guide = "none") +
+    geom_hline(yintercept = 0, linewidth = 0.25) +
+    labs(x = NULL, y = "exercise log2FC  (dilbaz trained / sedentary MTJ snRNA)",
+         title = "Top-25 cross-atlas MTJ markers — exercise response") +
+    globals$theme
+print(g8)
+ggsave(file.path(outpath, DateNamer("bar_mtj_markers_exercise_fc.pdf")), g8, width = 6, height = 7)
+
+write.table(fc %>% dplyr::select(gene_name, kim, pet, mtj_mean, rna_sed, rna_tr, exercise_log2FC),
+    file = file.path(outpath, DateNamer("table_mtj_markers_exercise_fc.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+*Input:* the top-25 genes by mean MTJ enrichment `(kim+pet)/2` from report 05's newest
+`table_crossdataset_MTJ_kim_vs_petrany.tsv` (Kim-17 × Petrany-26 concordance, Fig 5), joined to the
+dilbaz MTJ snRNA pseudobulk per-condition expression (`ex$rna_sed`, `ex$rna_tr` from
+`build_exercise_TE`).
+*Method:* exercise response = `log2((rna_tr + 1)/(rna_sed + 1))` — dilbaz trained-vs-sedentary MTJ
+snRNA log2 fold change (native MTJ = sedentary). Horizontal bars per gene, ordered by FC, red = up
+with training / blue = down; genes of the 25 not detected in dilbaz are dropped from the bars but
+kept (NA) in `table_mtj_markers_exercise_fc.tsv` (count reported).
+*Shows:* whether the most reproducible MTJ markers are themselves exercise-regulated in the native
+MTJ, and in which direction.
+
+## Pathway-gene expression table `(canvas: 026)`
+
+*Why this table:* makes the GO enrichment (Figs 4-5) traceable to specific genes and their
+expression — for every gene in an enriched pathway, its Ribo-seq and dilbaz MTJ snRNA-pseudobulk
+expression (sedentary + trained), so the reviewer can see which quantified genes drive each term.
+
+```{r pathway_gene_table}
+if(length(go_keep) > 0){
+    path_long = do.call(rbind, lapply(names(go_keep), function(cn){
+        gdf = go_keep[[cn]]
+        do.call(rbind, lapply(seq_len(nrow(gdf)), function(i){
+            gs = strsplit(gdf$geneID[i], "/")[[1]]
+            data.frame(gene_name = gs, response_class = cn,
+                       go_id = gdf$ID[i], go_term = gdf$Description[i],
+                       stringsAsFactors = FALSE)
+        }))
+    }))
+    path_genes = path_long %>%
+        group_by(gene_name, response_class) %>%
+        summarize(n_go_terms = dplyr::n_distinct(go_id),
+                  go_terms   = paste(unique(go_term), collapse = "; "),
+                  .groups = "drop") %>%
+        left_join(dplyr::distinct(cls, gene_name, log2FoldChange_MTJ_HA_CK8_HA),
+                  by = "gene_name") %>%
+        left_join(ex %>% dplyr::select(gene_name, ribo_sed, ribo_tr, rna_sed, rna_tr),
+                  by = "gene_name")
+    n_missing = sum(is.na(path_genes$ribo_sed))
+    message("Pathway genes: ", nrow(path_genes),
+            "  (missing exTE expression: ", n_missing, ")")
+    # CSV-only export — the table is no longer rendered inline (canvas 039)
+    write.table(path_genes,
+        file = file.path(outpath, DateNamer("table_pathway_genes.tsv")),
+        sep = "\t", quote = FALSE, row.names = FALSE)
+} else {
+    cat("No enriched GO terms retained — pathway-gene table skipped.\n")
+}
+```
+
+*Input:* the enriched GO BP terms per EXE-only class (Figs 4-5, accumulated in `go_keep`), exploded
+to member genes; joined to the exercise LFC (`cls`) and the Fig-7 `exTE$te` per-condition expression.
+*Method:* per (gene, class) the GO terms are collapsed (`go_terms`, `n_go_terms`); `ribo_sed`/
+`ribo_tr` = Ribo-seq MTJ (sedentary/trained), `rna_sed`/`rna_tr` = dilbaz MTJ snRNA pseudobulk.
+Genes below the exTE `detectable` filter join as `NA` (count reported, not dropped).
+*Output:* the full table is exported to `table_pathway_genes.tsv` only — **not shown inline**
+(canvas 039); it has a `response_class` column.
+
+## Export class tables
+
+```{r}
+for(cls_name in unique(cls$response_class)){
+    sub = cls %>% filter(response_class == cls_name)
+    write.table(
+        sub %>% dplyr::select(gene_id, gene_name, gene_biotype, response_class,
+                              starts_with("log2FoldChange"),
+                              starts_with("padj")),
+        file = file.path(outpath, DateNamer(paste0("table_", cls_name, ".tsv"))),
+        sep = "\t", quote = FALSE, row.names = FALSE)
+}
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

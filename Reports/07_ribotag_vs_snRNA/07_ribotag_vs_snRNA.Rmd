@@ -1,0 +1,983 @@
+---
+title: "07 — Ribo-Tag vs snRNA-seq marker concordance"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Reviewer question — Q4.** Which genes are Ribo-Tag-only versus snRNA-only, and is the Ribo-Tag-specific fraction higher at the MTJ than at the CK8 fibre — which would suggest that translational control is a defining characteristic of the MTJ? Performed for both the MTJ and the CK8 direction.
+>
+> **Purpose.** This report quantifies the modality-specific (Ribo-Tag vs snRNA) gene fractions in each direction (MTJ-up and CK8-up) to test whether a Ribo-Tag-only ("translational-only") signature is enriched at the MTJ relative to CK8.
+
+<!--
+# Canvas: Prompts/canvases/007_ribotag-vs-snrna.md
+Reviewer Q4: do the genes identified as MTJ-enriched by Ribo-Tag (Phase 2)
+also surface as MTJ-cluster markers in published snRNA-seq atlases? Is the
+fraction of "Ribo-only" genes higher in MTJ than in CK8? — i.e., is
+translational control more prominent at the MTJ?
+
+Upstream:
+  Riboseq_Differential_Expression()         (sedentary, MTJ vs CK8)
+  Phase 5 snRNA Seurat objects (Petrany / Kim 2020)
+
+Helpers : Scripts/Bin/DE_Reporting.R (snRNA_pseudobulk_DE,
+                                     compute_modality_overlap, classify_DE)
+          Scripts/Bin/GO_Enrichment.R
+          Scripts/Bin/snRNA_Loaders.R
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+    library(ggplot2)
+    library(ggrepel)
+    library(VennDiagram)
+    library(grid)
+})
+source.lib("ScanLib.R")
+source.lib("Bacon.R")
+source.lib("Read_Annotation.R")
+source.pro("Differential_Expression.R")
+source.pro("DE_Reporting.R")
+source.pro("GO_Enrichment.R")
+source.pro("snRNA_Loaders.R")
+
+report_name = "07_ribotag_vs_snRNA"
+outpath     = Path(file.path(.scripts.path, "Results", report_name),
+                   format(Sys.Date(), "%y%m%d"))
+
+path_gtf = "/data/local/vfranke/Annotation/mm39/EnsemblGenes/Mus_musculus.GRCm39.113.chr.gtf"
+annot    = read_Gene_Annotation(path_gtf)
+
+ribo_contrast = "MTJ_HA.Rpl22_CK8_HA.Rpl22"
+```
+
+## Bulk Ribo-Tag DE (sedentary)
+
+```{r}
+ribo = Riboseq_Differential_Expression()
+ribo_res = ribo$res %>% dplyr::rename(gene_id = id) %>%
+    left_join(annot, by = "gene_id") %>%
+    filter(gene_biotype == "protein_coding") %>%
+    classify_DE(ribo_contrast)
+```
+
+## Pseudobulk snRNA DE (MTJ-cluster vs rest)
+
+The Petrany 2020 atlas (`load_petrany_2020`) is clustered post-load (no
+author labels). The de-novo clustering (`FindClusters`, resolution 0.6)
+reproducibly yields 27 clusters (0–26); the MTJ cluster is **cluster 26**
+(99.3% `Col22a1+`, the canonical MTJ marker). We pin the cluster to `26`
+and *guard* it: a `stopifnot` confirms 26 is still the top-`Col22a1+`
+cluster, so a future re-cluster that shifts the numbering halts the report
+rather than silently selecting the wrong population.
+
+```{r}
+sn = load_petrany_2020()
+mtj_cluster = "26"   # Petrany MTJ cluster (pinned; see guard below)
+
+col22 = FetchData(sn, vars = c("Col22a1","seurat_clusters"))
+col22_summary = col22 %>%
+    group_by(seurat_clusters) %>%
+    summarize(pct_col22a1 = mean(Col22a1 > 0) * 100,
+              n_cells     = n()) %>%
+    arrange(desc(pct_col22a1))
+
+# Guard: the pinned cluster must exist and be the highest-Col22a1+ cluster.
+stopifnot(mtj_cluster %in% levels(sn$seurat_clusters))
+top_col22 = as.character(col22_summary$seurat_clusters[1])
+if(!identical(top_col22, mtj_cluster))
+    stop("Pinned MTJ cluster ", mtj_cluster, " is no longer the top-Col22a1+ cluster (now ",
+         top_col22, ", ", round(col22_summary$pct_col22a1[1], 1),
+         "%). Re-clustering changed the numbering — re-verify before trusting the pin.")
+message("MTJ cluster: ", mtj_cluster, " (pinned; Col22a1+ pct = ",
+        round(col22_summary$pct_col22a1[col22_summary$seurat_clusters == mtj_cluster], 1), "%)")
+
+sn$mtj_label = ifelse(as.character(sn$seurat_clusters) == mtj_cluster,
+                      "MTJ", "rest")
+```
+
+```{r sn_de}
+sn_de = snRNA_pseudobulk_DE(
+    seurat_obj    = sn,
+    group_col     = "mtj_label",
+    group_a       = "MTJ",
+    group_b       = "rest",
+    sample_col    = "sample_id",
+    contrast_name = "MTJ_vs_rest_petrany"
+)
+```
+
+*Method:* per-cell counts summed within (sample × group) bins to produce
+pseudobulk replicates → DESeq2 Wald test, contrast `MTJ` vs `rest`,
+thresholds `|LFC|>0.75`, `padj<0.05`.
+
+## Figure 1 — Venn: MTJ-up in bulk Ribo-Tag vs snRNA pseudobulk
+
+*Why this figure:* Q4 hinges on partitioning MTJ-up genes into Ribo-Tag-only, snRNA-only, and shared sets; the Ribo-only slice here is the candidate translational-control signature the reviewer asks us to identify.
+
+```{r fig1_venn, fig.width=5, fig.height=5}
+ribo_up = ribo_res %>%
+    filter(.data[[paste0("diff.", ribo_contrast)]] == "Up") %>%
+    pull(gene_name) %>% unique()
+sn_up   = sn_de %>%
+    filter(.data[["diff.MTJ_vs_rest_petrany"]] == "Up") %>%
+    pull(gene_name) %>% unique()
+
+venn_data = list(`Ribo-Tag MTJ-up` = ribo_up,
+                 `snRNA MTJ-up`     = sn_up)
+v = venn.diagram(venn_data, filename = NULL,
+                 fill = c("#E88C8C","#8CB4E8"), alpha = 0.5,
+                 cex = 1.5, cat.cex = 1.2)
+grid.newpage(); grid.draw(v)
+pdf(file.path(outpath, DateNamer("venn_MTJ_ribo_vs_sn_petrany.pdf")),
+    width = 5, height = 5)
+grid.draw(v); dev.off()
+```
+
+*Input:* MTJ-up gene sets from each modality.
+*Method:* simple set intersection.
+*Shows:* concordance between modalities. The Ribo-only slice is the
+reviewer's quantity of interest.
+
+## Figure 2 — Venn for the CK8 / "rest" direction
+
+*Why this figure:* the reviewer requires the same Ribo-only/snRNA-only partition for CK8 as a comparator; without the CK8 direction there is no baseline against which an MTJ-specific excess of Ribo-only genes can be claimed.
+
+```{r fig2_venn_ck8, fig.width=5, fig.height=5}
+ribo_dn = ribo_res %>%
+    filter(.data[[paste0("diff.", ribo_contrast)]] == "Down") %>%
+    pull(gene_name) %>% unique()
+sn_dn   = sn_de %>%
+    filter(.data[["diff.MTJ_vs_rest_petrany"]] == "Down") %>%
+    pull(gene_name) %>% unique()
+
+v2 = venn.diagram(list(`Ribo-Tag CK8-up` = ribo_dn,
+                       `snRNA non-MTJ-up` = sn_dn),
+                  filename = NULL,
+                  fill = c("#E88C8C","#8CB4E8"), alpha = 0.5,
+                  cex = 1.5, cat.cex = 1.2)
+grid.newpage(); grid.draw(v2)
+pdf(file.path(outpath, DateNamer("venn_CK8_ribo_vs_sn_petrany.pdf")),
+    width = 5, height = 5)
+grid.draw(v2); dev.off()
+```
+
+## Figure 3 — Per-gene LFC scatter (bulk vs sn) `(canvas: 046, 056, 063)`
+
+*Why this figure:* set-membership Venns are threshold-binary; the scatter shows whether Ribo-only genes are genuinely off in snRNA or just sub-threshold, distinguishing real modality divergence from boundary effects that would otherwise inflate the translational-only count.
+
+*Annotation:* the on-plot percentages give the **Ribo-only (translation-specific) share** of each
+cell type's Ribo-Tag-enriched set — upper-left (MTJ, above y=x) =
+`ribo_only_MTJ / (both_MTJ + ribo_only_MTJ)`; lower-right (CK8, below y=x) =
+`ribo_only_CK8 / (both_CK8 + ribo_only_CK8)`. A high share means most ribosome-enriched genes are
+translation-specific rather than also transcriptionally enriched. The same numbers are tabulated
+below the figure.
+
+*Selection note (canvas 046):* both Ribo-only sets carry a **symmetric ribo-vs-rna stringency** — a
+gene is counted as ribosome-enriched only when its Ribo cell-type bias exceeds its snRNA bias:
+**`ribo_only_MTJ`** = Ribo-MTJ-enriched (`ribo Up`), not snRNA-Up, **and `ribo_LFC > sn_LFC`** (left
+of the y=x line, "ribo > rna in MTJ"); **`ribo_only_CK8`** = Ribo-CK8-enriched (`ribo Down`), not
+snRNA-Down, **and `ribo_LFC < sn_LFC`** (right of the line, "ribo < rna in CK8"). Genes failing the
+gate drop to `neither`. This replaces the earlier canvas-031 `abs(sn_LFC) < 1` CK8 filter and now
+gates **both** sides (no asymmetry). Propagates to Figs 3b, 5, 6, 7, 9 and the GO tables.
+
+```{r fig3_scatter, fig.width=5, fig.height=5}
+ribo_join = ribo_res %>%
+    dplyr::select(gene_name,
+                  ribo_LFC  = !!paste0("log2FoldChange.", ribo_contrast),
+                  ribo_padj = !!paste0("padj.",           ribo_contrast),
+                  ribo_class = !!paste0("diff.",          ribo_contrast))
+sn_join = sn_de %>%
+    dplyr::select(gene_name,
+                  sn_LFC  = !!sym("log2FoldChange.MTJ_vs_rest_petrany"),
+                  sn_padj = !!sym("padj.MTJ_vs_rest_petrany"),
+                  sn_class = !!sym("diff.MTJ_vs_rest_petrany"))
+joined = inner_join(ribo_join, sn_join, by = "gene_name") %>%
+    mutate(quadrant = case_when(
+        ribo_class == "Up"   & sn_class == "Up"   ~ "both_MTJ",
+        # ribo_only_MTJ (canvas 046): Ribo-MTJ-enriched, not snRNA-Up, AND ribo>rna (ribo_LFC > sn_LFC,
+        # left of y=x) — translationally MTJ-enriched beyond the transcriptional signal.
+        ribo_class == "Up"   & sn_class != "Up"   & ribo_LFC > sn_LFC ~ "ribo_only_MTJ",
+        ribo_class != "Up"   & sn_class == "Up"   ~ "sn_only_MTJ",
+        ribo_class == "Down" & sn_class == "Down" ~ "both_CK8",
+        # ribo_only_CK8 (canvas 046): Ribo-CK8-enriched, not snRNA-Down, AND ribo<rna (ribo_LFC < sn_LFC,
+        # right of y=x). Replaces the canvas-031 abs(sn_LFC)<1 filter; symmetric to the MTJ side.
+        ribo_class == "Down" & sn_class != "Down" & ribo_LFC < sn_LFC ~ "ribo_only_CK8",
+        ribo_class != "Down" & sn_class == "Down" ~ "sn_only_CK8",
+        TRUE                                      ~ "neither"
+    ))
+message("ribo_only_MTJ (ribo>rna, ribo_LFC > sn_LFC): ", sum(joined$quadrant == "ribo_only_MTJ"),
+        "  |  dropped to 'neither' by the ribo>rna gate: ",
+        sum(joined$ribo_class == "Up" & joined$sn_class != "Up" & joined$ribo_LFC <= joined$sn_LFC))
+message("ribo_only_CK8 (ribo<rna, ribo_LFC < sn_LFC): ", sum(joined$quadrant == "ribo_only_CK8"),
+        "  |  dropped to 'neither' by the ribo<rna gate: ",
+        sum(joined$ribo_class == "Down" & joined$sn_class != "Down" & joined$ribo_LFC >= joined$sn_LFC))
+
+# geometry oracle (canvas 046): the ribo_only sets sit on the correct side of y=x
+with(joined[joined$quadrant == "ribo_only_MTJ", ],
+     stopifnot(all(ribo_LFC > sn_LFC), all(ribo_LFC > 0)))
+with(joined[joined$quadrant == "ribo_only_CK8", ],
+     stopifnot(all(ribo_LFC < sn_LFC), all(ribo_LFC < 0)))
+# positive control: Klf2 (translation-specific MTJ) should be ribo_only_MTJ, not gated out
+if("Klf2" %in% joined$gene_name)
+    message("Klf2 quadrant: ", joined$quadrant[joined$gene_name == "Klf2"])
+
+# Ribo-only fraction of each cell type's Ribo-Tag-enriched set (= translation-specific share):
+#   MTJ (above y=x): ribo_only_MTJ / (both_MTJ + ribo_only_MTJ)
+#   CK8 (below y=x): ribo_only_CK8 / (both_CK8 + ribo_only_CK8)
+qn       = table(factor(joined$quadrant, levels = c("both_MTJ","ribo_only_MTJ","both_CK8","ribo_only_CK8")))
+tot_mtj  = qn[["both_MTJ"]] + qn[["ribo_only_MTJ"]]
+tot_ck8  = qn[["both_CK8"]] + qn[["ribo_only_CK8"]]
+pct_mtj  = 100 * qn[["ribo_only_MTJ"]] / tot_mtj
+pct_ck8  = 100 * qn[["ribo_only_CK8"]] / tot_ck8
+message(sprintf("Ribo-only share — MTJ (above y=x): %d/%d = %.1f%%  |  CK8 (below y=x): %d/%d = %.1f%%",
+                qn[["ribo_only_MTJ"]], tot_mtj, pct_mtj, qn[["ribo_only_CK8"]], tot_ck8, pct_ck8))
+
+# show only the four categories of interest; everything else (sn_only_*, neither) -> gray "other" (canvas 056)
+cat4 = c("both_MTJ","ribo_only_MTJ","both_CK8","ribo_only_CK8")
+joined = joined %>% mutate(quad4 = ifelse(quadrant %in% cat4, quadrant, "other"))
+stopifnot(setNames(as.integer(table(factor(joined$quad4, levels = cat4))), cat4) ==
+          sapply(cat4, function(k) sum(joined$quadrant == k)))   # kable/plot counts match the quadrant table
+
+markers4 = c("Tigd4", "Klf2", "Klf5", "Col22a1")
+lab4 = joined %>% filter(gene_name %in% markers4)
+g3 = ggplot(joined, aes(sn_LFC, ribo_LFC, color = quad4)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    scale_color_manual(values = c(
+        both_MTJ      = "#9467BD", ribo_only_MTJ = "#E88C8C",
+        both_CK8      = "#2CA02C", ribo_only_CK8 = "#FF7F0E",
+        other         = "lightgray"),
+        breaks = cat4) +   # legend lists only the four target categories
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = 0, linewidth = 0.25) +
+    geom_vline(xintercept = 0, linewidth = 0.25) +
+    geom_point(data = lab4, color = "black", size = 1.3) +
+    ggrepel::geom_text_repel(data = lab4, aes(label = gene_name), color = "black", size = 2.8,
+                             min.segment.length = 0, max.overlaps = Inf) +
+    # Ribo-only % of the Ribo-enriched set: MTJ above the line (upper-left), CK8 below (lower-right)
+    annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.4, size = 2.8, fontface = "italic",
+             color = "#E88C8C",
+             label = sprintf("MTJ Ribo-only (above y=x)\n%d/%d = %.1f%%",
+                             qn[["ribo_only_MTJ"]], tot_mtj, pct_mtj)) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5, size = 2.8, fontface = "italic",
+             color = "#FF7F0E",
+             label = sprintf("CK8 Ribo-only (below y=x)\n%d/%d = %.1f%%",
+                             qn[["ribo_only_CK8"]], tot_ck8, pct_ck8)) +
+    labs(x = "log2 LFC (snRNA MTJ vs rest)",
+         y = "log2 LFC (Ribo-Tag MTJ vs CK8)") +
+    globals$theme
+print(g3)
+ggsave(file.path(outpath, DateNamer("scatter_LFC_bulk_vs_sn.pdf")),
+       g3, width = 5, height = 5)
+
+knitr::kable(
+    data.frame(
+        side               = c("MTJ (above y=x)", "CK8 (below y=x)"),
+        ribo_only          = c(qn[["ribo_only_MTJ"]], qn[["ribo_only_CK8"]]),
+        both               = c(qn[["both_MTJ"]],      qn[["both_CK8"]]),
+        total_ribo_enriched= c(tot_mtj, tot_ck8),
+        pct_ribo_only      = round(c(pct_mtj, pct_ck8), 1)),
+    caption = "Counts for the four categories of interest — both_MTJ, ribo_only_MTJ (MTJ row) and both_CK8, ribo_only_CK8 (CK8 row) — and the Ribo-only (translation-specific) share of each cell type's Ribo-Tag-enriched set: ribo_only / (both + ribo_only). MTJ = above the y=x line (ribo>rna), CK8 = below (ribo<rna). (canvas 056)")
+```
+
+## Figure 3b — Gene counts per modality quadrant `(canvas: 025, 046)`
+
+*Why this figure:* the count companion to the Figure 3 scatter — how many genes fall in each
+Ribo/snRNA quadrant, in the **same colours as the Fig 3 scatter**, making the size of each
+translational-only / transcriptional-only selection explicit.
+
+```{r fig3b_quadrant_counts, fig.width=6, fig.height=4}
+quad_levels = c("both_MTJ","ribo_only_MTJ","sn_only_MTJ","both_CK8","ribo_only_CK8","sn_only_CK8")
+quad_cols   = c(both_MTJ = "#9467BD", ribo_only_MTJ = "#E88C8C", sn_only_MTJ = "#1F77B4",
+                both_CK8 = "#2CA02C", ribo_only_CK8 = "#FF7F0E", sn_only_CK8 = "#17BECF")
+qc = joined %>% filter(quadrant %in% quad_levels) %>%
+    dplyr::count(quadrant) %>%
+    mutate(quadrant = factor(quadrant, levels = quad_levels))
+g3b = ggplot(qc, aes(quadrant, n, fill = quadrant)) +
+    geom_col() + geom_text(aes(label = n), vjust = -0.3, size = 3) +
+    scale_fill_manual(values = quad_cols, guide = "none") +
+    labs(x = NULL, y = "# genes", title = "Genes per Ribo×snRNA quadrant") +
+    globals$theme + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(g3b)
+ggsave(file.path(outpath, DateNamer("bar_quadrant_counts.pdf")), g3b, width = 6, height = 4)
+```
+
+*Input:* the Fig 3 `joined` quadrant assignment (six informative quadrants; `neither` excluded).
+*Method:* `dplyr::count` per quadrant; bars coloured by the **Fig-3 scatter quadrant palette**
+(`quad_cols`).
+*Shows:* the relative sizes of the modality-concordant vs modality-specific selections.
+
+## Figure 3c — Bulk RNA-seq vs Petrany snRNA LFC `(canvas: 076)`
+
+*Why this figure:* the transcriptional control for Figure 3. Fig 3 puts the **ribosome-bound**
+MTJ/CK8 LFC against the snRNA MTJ-vs-rest LFC and reads the off-diagonal spread as translational
+control. This panel swaps the y axis for the **bulk RNA-seq** Tigd4/CK8 LFC — two transcriptional
+measurements of the same contrast — so the divergence attributable to platform/dissection alone can
+be subtracted from the divergence attributed to translation. If the Ribo arm scatters further from
+y=x than the bulk-RNA arm does, the excess is the translational component.
+
+```{r fig3c_bulkrna_vs_sn, fig.width=5, fig.height=5}
+rna_contrast = "Tigd4_CK8"          # bulk RNA: Tigd4+ (MTJ fibre-end) vs CK8
+rna = RNAseq_Differential_Expression()
+rna_res = rna$res %>% dplyr::rename(gene_id = id) %>%
+    left_join(annot, by = "gene_id") %>%
+    filter(gene_biotype == "protein_coding") %>%
+    classify_DE(rna_contrast)
+
+rna_join = rna_res %>%
+    dplyr::select(gene_name,
+                  rna_LFC   = !!paste0("log2FoldChange.", rna_contrast),
+                  rna_padj  = !!paste0("padj.",           rna_contrast),
+                  rna_class = !!paste0("diff.",           rna_contrast))
+
+# same quadrant logic as Fig 3 (canvas 046 geometry gate) with rna_LFC in place of ribo_LFC,
+# so the modality-only shares below are numerically comparable to the Fig-3 Ribo-only shares
+joined_rna = inner_join(rna_join, sn_join, by = "gene_name") %>%
+    mutate(quadrant = case_when(
+        rna_class == "Up"   & sn_class == "Up"   ~ "both_MTJ",
+        rna_class == "Up"   & sn_class != "Up"   & rna_LFC > sn_LFC ~ "rna_only_MTJ",
+        rna_class != "Up"   & sn_class == "Up"   ~ "sn_only_MTJ",
+        rna_class == "Down" & sn_class == "Down" ~ "both_CK8",
+        rna_class == "Down" & sn_class != "Down" & rna_LFC < sn_LFC ~ "rna_only_CK8",
+        rna_class != "Down" & sn_class == "Down" ~ "sn_only_CK8",
+        TRUE                                     ~ "neither"))
+
+# geometry oracle (canvas 046, mirrored): the rna_only sets sit on the correct side of y=x
+with(joined_rna[joined_rna$quadrant == "rna_only_MTJ", ],
+     stopifnot(all(rna_LFC > sn_LFC), all(rna_LFC > 0)))
+with(joined_rna[joined_rna$quadrant == "rna_only_CK8", ],
+     stopifnot(all(rna_LFC < sn_LFC), all(rna_LFC < 0)))
+# positive control: Col22a1 must be MTJ-positive on both axes
+col22_chk = joined_rna %>% filter(gene_name == "Col22a1")
+stopifnot(nrow(col22_chk) == 1, col22_chk$rna_LFC > 0, col22_chk$sn_LFC > 0)
+
+qr      = table(factor(joined_rna$quadrant,
+                       levels = c("both_MTJ","rna_only_MTJ","both_CK8","rna_only_CK8")))
+rtot_mtj = qr[["both_MTJ"]] + qr[["rna_only_MTJ"]]
+rtot_ck8 = qr[["both_CK8"]] + qr[["rna_only_CK8"]]
+# bulk RNA calls few DE genes (~10^1-10^2 per direction), so a denominator can legitimately be 0
+safe_pct = function(num, den) if(den == 0) NA_real_ else 100 * num / den
+rpct_mtj = safe_pct(qr[["rna_only_MTJ"]], rtot_mtj)
+rpct_ck8 = safe_pct(qr[["rna_only_CK8"]], rtot_ck8)
+
+# Agreement with the snRNA arm, per modality — the headline comparison against Fig 3.
+# Both arms MUST be scored on the same genes: the Ribo and bulk-RNA DE objects have different
+# gene universes (~14.7k vs ~18.6k), and scoring each on its own universe changes the answer.
+rho_set = inner_join(
+    joined     %>% distinct(gene_name, .keep_all = TRUE) %>%
+                   dplyr::select(gene_name, ribo_LFC, sn_LFC, sn_class),
+    joined_rna %>% distinct(gene_name, .keep_all = TRUE) %>%
+                   dplyr::select(gene_name, rna_LFC),
+    by = "gene_name")
+sp = function(a, b) suppressWarnings(cor(a, b, method = "spearman", use = "complete.obs"))
+rho_ribo = sp(rho_set$ribo_LFC, rho_set$sn_LFC)
+rho_rna  = sp(rho_set$rna_LFC,  rho_set$sn_LFC)
+# most genes are null in both arms, so the all-gene rho is noise-dominated; restrict to the genes
+# the snRNA arm actually calls DE for the comparison that carries signal
+sn_de_set   = rho_set %>% filter(sn_class %in% c("Up","Down"))
+rho_ribo_de = sp(sn_de_set$ribo_LFC, sn_de_set$sn_LFC)
+rho_rna_de  = sp(sn_de_set$rna_LFC,  sn_de_set$sn_LFC)
+
+rho_tab = data.frame(
+    gene_set   = c(sprintf("all shared genes (n = %d)", nrow(rho_set)),
+                   sprintf("snRNA-DE genes only (n = %d)", nrow(sn_de_set))),
+    rho_ribo_vs_snRNA = round(c(rho_ribo, rho_ribo_de), 3),
+    rho_bulkRNA_vs_snRNA = round(c(rho_rna, rho_rna_de), 3))
+knitr::kable(rho_tab, caption = "Spearman agreement with the Petrany snRNA MTJ-vs-rest LFC, for the Ribo-Tag arm (Fig 3) and the bulk RNA arm (this figure), both scored on the SAME shared gene set. The bulk RNA arm is the weaker match to the snRNA MTJ signature, so the Fig-3 off-diagonal spread is not simply generic cross-platform disagreement. (canvas 076)")
+cat(sprintf("snRNA agreement (Spearman rho, shared n=%d): Ribo-Tag %.2f | bulk RNA %.2f | on snRNA-DE genes (n=%d): Ribo-Tag %.2f | bulk RNA %.2f\n",
+            nrow(rho_set), rho_ribo, rho_rna, nrow(sn_de_set), rho_ribo_de, rho_rna_de))
+cat(sprintf("Modality-only share — MTJ: bulk RNA %.1f%% vs Ribo-Tag %.1f%% | CK8: bulk RNA %.1f%% vs Ribo-Tag %.1f%%\n",
+            rpct_mtj, pct_mtj, rpct_ck8, pct_ck8))
+
+cat4r = c("both_MTJ","rna_only_MTJ","both_CK8","rna_only_CK8")
+joined_rna = joined_rna %>% mutate(quad4 = ifelse(quadrant %in% cat4r, quadrant, "other"))
+lab4r = joined_rna %>% filter(gene_name %in% markers4)
+
+g3c = ggplot(joined_rna, aes(sn_LFC, rna_LFC, color = quad4)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    scale_color_manual(values = c(                 # Fig-3 palette, RNA arm in place of Ribo
+        both_MTJ     = "#9467BD", rna_only_MTJ = "#E88C8C",
+        both_CK8     = "#2CA02C", rna_only_CK8 = "#FF7F0E",
+        other        = "lightgray"),
+        breaks = cat4r) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_hline(yintercept = 0, linewidth = 0.25) +
+    geom_vline(xintercept = 0, linewidth = 0.25) +
+    geom_point(data = lab4r, color = "black", size = 1.3) +
+    ggrepel::geom_text_repel(data = lab4r, aes(label = gene_name), color = "black", size = 2.8,
+                             min.segment.length = 0, max.overlaps = Inf) +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.08, vjust = 1.4, size = 2.8, fontface = "italic",
+             color = "#E88C8C",
+             label = sprintf("MTJ RNA-only (above y=x)\n%d/%d = %.1f%%",
+                             qr[["rna_only_MTJ"]], rtot_mtj, rpct_mtj)) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5, size = 2.8, fontface = "italic",
+             color = "#FF7F0E",
+             label = sprintf("CK8 RNA-only (below y=x)\n%d/%d = %.1f%%",
+                             qr[["rna_only_CK8"]], rtot_ck8, rpct_ck8)) +
+    labs(x = "log2 LFC (snRNA MTJ vs rest)",
+         y = "log2 LFC (bulk RNA Tigd4/CK8)",
+         title = sprintf("bulk RNA vs snRNA — rho = %.2f (Ribo-Tag arm: %.2f; shared n = %d)",
+                         rho_rna, rho_ribo, nrow(rho_set))) +
+    globals$theme
+print(g3c)
+ggsave(file.path(outpath, DateNamer("scatter_LFC_bulkRNA_vs_sn.pdf")), g3c, width = 5, height = 5)
+
+write.table(joined_rna,
+    file = file.path(outpath, DateNamer("table_per_gene_bulkRNA_sn_join.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+
+knitr::kable(
+    data.frame(
+        side                = c("MTJ (above y=x)", "CK8 (below y=x)"),
+        rna_only            = c(qr[["rna_only_MTJ"]], qr[["rna_only_CK8"]]),
+        both                = c(qr[["both_MTJ"]],     qr[["both_CK8"]]),
+        total_rna_enriched  = c(rtot_mtj, rtot_ck8),
+        pct_rna_only        = round(c(rpct_mtj, rpct_ck8), 1),
+        pct_ribo_only_fig3  = round(c(pct_mtj, pct_ck8), 1)),
+    caption = "Bulk-RNA vs snRNA quadrant counts, with the modality-only share per side. The last column repeats the Fig-3 Ribo-only share for the same side, computed with the identical gate — the difference between the two columns is the part of the modality divergence that is specific to the ribosome-bound arm. (canvas 076)")
+```
+
+*Input:* bulk RNA DE (`RNAseq_Differential_Expression()`, contrast `Tigd4_CK8`, protein-coding,
+`classify_DE` Up/Down/No) joined by `gene_name` to the Petrany pseudobulk DE (`sn_de`,
+`MTJ_vs_rest_petrany`, `|LFC|>0.75`, `padj<0.05`) — the same `sn_join` the Fig-3 Ribo arm uses.
+*Method:* per-gene LFC scatter, x = snRNA MTJ-vs-rest, y = bulk RNA Tigd4/CK8, dashed y=x; quadrants
+assigned with the **canvas-046 gate applied to `rna_LFC`** (`rna_only_MTJ` = RNA-Up, not snRNA-Up,
+`rna_LFC > sn_LFC`; `rna_only_CK8` mirrored), so the on-plot percentages are the direct counterpart
+of Fig 3's Ribo-only shares. Spearman ρ for both arms printed in the title; Tigd4/Klf2/Klf5/Col22a1
+labelled. Exports `scatter_LFC_bulkRNA_vs_sn.pdf` and `table_per_gene_bulkRNA_sn_join.tsv`.
+*Shows:* how much MTJ/CK8 signal two *transcriptional* assays already disagree on — the intended
+floor for Fig 3. The result runs the other way from the naive expectation: on the shared gene set the
+**bulk RNA arm agrees with snRNA *less* well than the Ribo-Tag arm does** (see the ρ table; the gap
+widens sharply on snRNA-DE genes). So the Fig-3 off-diagonal spread is not merely generic
+cross-platform disagreement that the Ribo arm inherits — the ribosome-bound arm is the *better* match
+to the snRNA MTJ signature, and the weak link is the bulk RNA Tigd4/CK8 contrast itself.
+*Caveats:* (1) the snRNA arm is MTJ-vs-**rest**, so "CK8" here is the non-MTJ nuclear pool, a loose
+CK8 proxy (inherited from Figs 2–3). (2) The bulk RNA arm calls very few genes DE (order 10¹–10² per
+direction), so `both_CK8` can be 0 and the CK8-side percentage is computed over a handful of genes —
+read this panel from ρ, not from the quadrant percentages. (3) Both ρ are computed on the shared gene
+set after de-duplicating gene symbols; scoring each arm on its own DE universe is not comparable.
+
+## Figure 3d — Detection gap: Ribo-Tag MTJ genes not detected in the Petrany MTJ cluster `(canvas: 077)`
+
+*Why this figure:* everything above compares **fold changes**, which only exist for genes both assays
+measure. This asks the prior question — how many genes does the Ribo-Tag MTJ pulldown see at all that
+the Petrany MTJ cluster never sees? That set is invisible to Figs 3/3c by construction, and it bounds
+how much of the MTJ translatome an snRNA atlas can represent. Because the Petrany MTJ cluster is only
+137 nuclei, the same statistic is broken out by Ribo-Tag expression decile: a dropout-driven gap must
+shrink steeply with expression, whereas a flat high-expression tail is a genuine modality difference.
+
+```{r fig3d_detection_gap, fig.width=6.5, fig.height=4}
+ribo_cnt = DESeq2::counts(ribo$dds)                       # raw counts
+mtj_lib  = as.data.frame(SummarizedExperiment::colData(ribo$dds))$cell == "MTJ"
+cat(sprintf("Ribo-Tag MTJ libraries: %d | Petrany MTJ cluster %s: %d nuclei | features in Petrany object: %d\n",
+            sum(mtj_lib), mtj_cluster, sum(sn$seurat_clusters == mtj_cluster), nrow(sn)))
+
+det = data.frame(gene_id   = rownames(ribo_cnt),
+                 ribo_mean = rowMeans(ribo_cnt[, mtj_lib, drop = FALSE]),
+                 ribo_nlib = rowSums(ribo_cnt[, mtj_lib, drop = FALSE] > 0)) %>%
+    left_join(annot, by = "gene_id") %>%
+    filter(gene_biotype == "protein_coding", !is.na(gene_name), nzchar(gene_name)) %>%
+    distinct(gene_name, .keep_all = TRUE)
+# snRNA profiles NUCLEI, so mt- transcripts are absent by construction — excluding them keeps the
+# gap from being inflated by genes the comparator can never detect (they are the top Ribo-Tag counts)
+n_mito = sum(grepl("^mt-", det$gene_name))
+det = det %>% filter(!grepl("^mt-", gene_name))
+cat(sprintf("Ribo universe: %d protein-coding genes (%d mitochondrial genes excluded — undetectable in snRNA)\n",
+            nrow(det), n_mito))
+
+sc_mtj = SeuratObject::GetAssayData(sn, assay = "RNA", layer = "counts")[, sn$seurat_clusters == mtj_cluster, drop = FALSE]
+pet_det = data.frame(gene_name = rownames(sc_mtj),
+                     pet_umi   = Matrix::rowSums(sc_mtj),
+                     pet_pct   = 100 * Matrix::rowSums(sc_mtj > 0) / ncol(sc_mtj))
+det = det %>% left_join(pet_det, by = "gene_name") %>%
+    mutate(in_pet_object = !is.na(pet_umi),
+           pet_umi       = ifelse(is.na(pet_umi), 0, pet_umi),
+           pet_pct       = ifelse(is.na(pet_pct), 0, pet_pct))
+
+# positive controls: the canonical MTJ markers must be detected in BOTH arms
+pc_chk = det %>% filter(gene_name %in% c("Col22a1","Tigd4"))
+stopifnot(nrow(pc_chk) == 2, all(pc_chk$ribo_mean > 0), all(pc_chk$pet_umi > 0))
+
+gap_row = function(d, label){
+    data.frame(ribo_detection = label,
+               n_ribo_genes   = nrow(d),
+               absent_from_object = sum(!d$in_pet_object),
+               zero_umi_in_MTJ    = sum(d$pet_umi == 0),
+               pct_zero_umi       = round(100 * mean(d$pet_umi == 0), 1),
+               under_1pct_nuclei  = sum(d$pet_pct < 1),
+               pct_under_1pct     = round(100 * mean(d$pet_pct < 1), 1))
+}
+gap_tab = bind_rows(
+    lapply(c(1, 5, 10), function(t) gap_row(det %>% filter(ribo_mean >= t),
+                                            sprintf("mean raw count >= %d", t))),
+    gap_row(det %>% filter(ribo_nlib == sum(mtj_lib)),
+            sprintf("count > 0 in all %d MTJ libs", sum(mtj_lib))))
+knitr::kable(gap_tab, caption = "Detection gap between the Ribo-Tag MTJ arm and the Petrany MTJ cluster. Rows = how strictly a gene must be detected in the 3 Ribo-Tag MTJ libraries; columns = how strictly it fails in the 137-nucleus Petrany MTJ cluster (absent from the object's feature list / 0 UMI summed over the cluster / detected in <1% of its nuclei). Protein-coding, mitochondrial genes excluded. (canvas 077)")
+write.table(gap_tab, file = file.path(outpath, DateNamer("table_detection_gap_ribo_vs_petrany.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# is the gap dropout or modality? split the 0-UMI fraction by Ribo-Tag expression decile
+dec = det %>% filter(ribo_mean >= 1) %>%
+    mutate(decile = dplyr::ntile(ribo_mean, 10)) %>%
+    group_by(decile) %>%
+    summarize(n = n(), zero = sum(pet_umi == 0), pct_zero = 100 * mean(pet_umi == 0),
+              ribo_min = min(ribo_mean), ribo_max = max(ribo_mean), .groups = "drop")
+g3d = ggplot(dec, aes(factor(decile), pct_zero)) +
+    geom_col(fill = "#E88C8C") +
+    geom_text(aes(label = sprintf("%.0f%%", pct_zero)), vjust = -0.3, size = 2.6) +
+    labs(x = "Ribo-Tag MTJ expression decile (1 = lowest)",
+         y = "% with 0 UMI in\nPetrany MTJ cluster",
+         title = sprintf("Detection gap vs Ribo-Tag expression (n = %d genes, mean count >= 1)", sum(dec$n))) +
+    globals$theme
+print(g3d)
+ggsave(file.path(outpath, DateNamer("bar_detection_gap_by_expression.pdf")), g3d, width = 6.5, height = 4)
+knitr::kable(dec %>% mutate(across(c(pct_zero, ribo_min, ribo_max), ~round(.x, 1))),
+             caption = "Per-decile detection gap. `ribo_min`/`ribo_max` give the Ribo-Tag MTJ mean-count range of each decile. (canvas 077)")
+
+# per-gene export of the gap set (Ribo-Tag detected, zero UMI in the Petrany MTJ cluster)
+gap_genes = det %>% filter(ribo_mean >= 10, pet_umi == 0) %>%
+    arrange(-ribo_mean) %>%
+    dplyr::transmute(gene_id, gene_name, ribo_mean_MTJ = round(ribo_mean, 1),
+                     ribo_nlib, in_pet_object)
+write.table(gap_genes, file = file.path(outpath, DateNamer("table_ribo_MTJ_not_in_petrany.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cat(sprintf("Exported %d genes with Ribo-Tag MTJ mean count >= 10 and 0 UMI in the Petrany MTJ cluster.\n",
+            nrow(gap_genes)))
+```
+
+*Input:* raw counts from `ribo$dds` (3 Ribo-Tag MTJ libraries, `colData$cell == "MTJ"`),
+protein-coding and non-mitochondrial, one row per gene symbol; raw UMI counts from the Petrany MTJ
+cluster (pinned cluster 26, 137 nuclei).
+*Method:* pure detection, no DE model. Rows of the table are Ribo-Tag detection thresholds (mean raw
+count ≥ 1/5/10, or >0 in all 3 MTJ libraries); columns are three strictness levels of "not detected"
+in Petrany — not in the object's feature list at all, 0 UMI summed across the cluster, or detected in
+<1% of its nuclei. The bar plot splits the 0-UMI fraction by decile of Ribo-Tag MTJ mean count.
+*Shows:* the size of the Ribo-Tag-only detection space — genes the snRNA comparator cannot contribute
+a fold change for, and which therefore never appear in Figs 3/3c.
+*Caveat / how to read it:* with only 137 nuclei the cluster has limited detection power, so a gene
+expressed at low level will read as 0 UMI purely by dropout. The decile plot is the control — quote
+the high-decile percentages (where dropout is least plausible), not the pooled headline number.
+Mitochondrial genes are excluded because snRNA-seq profiles nuclei and cannot detect them at all.
+
+## Figure 4 — Bulk-only fraction by direction (the reviewer's question)
+
+*Why this figure:* this is the direct quantitative answer to Q4 — it places the MTJ-up and CK8-up Ribo-only fractions side by side so the reviewer can read off whether translational-only control is higher at the MTJ.
+
+```{r fig4_bar, fig.width=5, fig.height=4}
+ovl_mtj = compute_modality_overlap(
+    bulk_de       = ribo_res,
+    sc_de         = sn_de,
+    bulk_diff_col = paste0("diff.", ribo_contrast),
+    sc_diff_col   = "diff.MTJ_vs_rest_petrany",
+    direction     = "Up")
+ovl_ck8 = compute_modality_overlap(
+    bulk_de       = ribo_res,
+    sc_de         = sn_de,
+    bulk_diff_col = paste0("diff.", ribo_contrast),
+    sc_diff_col   = "diff.MTJ_vs_rest_petrany",
+    direction     = "Down")
+
+frac_df = bind_rows(
+    tibble(direction = "MTJ-up",
+           bulk_only = ovl_mtj$contingency["bulk_hit","sc_no"],
+           bulk_hit  = ovl_mtj$contingency["bulk_hit","sc_hit"] +
+                       ovl_mtj$contingency["bulk_hit","sc_no"]),
+    tibble(direction = "CK8-up",
+           bulk_only = ovl_ck8$contingency["bulk_hit","sc_no"],
+           bulk_hit  = ovl_ck8$contingency["bulk_hit","sc_hit"] +
+                       ovl_ck8$contingency["bulk_hit","sc_no"])
+) %>% mutate(fraction_bulk_only = bulk_only / bulk_hit)
+
+g4 = ggplot(frac_df, aes(direction, fraction_bulk_only, fill = direction)) +
+    geom_col() +
+    geom_text(aes(label = sprintf("%d / %d", bulk_only, bulk_hit)),
+              vjust = -0.3) +
+    labs(x = NULL, y = "Fraction of bulk-DE genes\nnot DE in snRNA",
+         title = "Translational-only (bulk-only) hits per direction") +
+    globals$theme
+print(g4)
+ggsave(file.path(outpath, DateNamer("bar_bulk_only_fraction.pdf")),
+       g4, width = 5, height = 4)
+```
+
+*Input:* `compute_modality_overlap()` 2x2 contingencies for each direction.
+*Method:* fraction = bulk-DE-but-not-sn-DE / total bulk-DE per direction.
+*Shows:* the reviewer's headline test — is translational-only control
+*more prominent* at the MTJ than at the CK8 fibre? Higher bar at MTJ-up
+supports "yes".
+
+```{r overlap_stats}
+stats = tibble(
+    direction       = c("MTJ-up","CK8-up"),
+    n_total         = c(ovl_mtj$n_total,    ovl_ck8$n_total),
+    n_universe      = c(ovl_mtj$n_universe, ovl_ck8$n_universe),
+    n_discordant    = c(ovl_mtj$n_discordant, ovl_ck8$n_discordant),
+    bulk_hit        = c(ovl_mtj$contingency["bulk_hit","sc_hit"] +
+                        ovl_mtj$contingency["bulk_hit","sc_no"],
+                        ovl_ck8$contingency["bulk_hit","sc_hit"] +
+                        ovl_ck8$contingency["bulk_hit","sc_no"]),
+    sc_hit          = c(ovl_mtj$contingency["bulk_hit","sc_hit"] +
+                        ovl_mtj$contingency["bulk_no","sc_hit"],
+                        ovl_ck8$contingency["bulk_hit","sc_hit"] +
+                        ovl_ck8$contingency["bulk_no","sc_hit"]),
+    both            = c(ovl_mtj$contingency["bulk_hit","sc_hit"],
+                        ovl_ck8$contingency["bulk_hit","sc_hit"]),
+    hyper_p         = c(ovl_mtj$hyper_p, ovl_ck8$hyper_p)
+)
+write.table(stats,
+    file = file.path(outpath, DateNamer("table_modality_overlap_stats.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+knitr::kable(stats, caption = "Modality-overlap hypergeometric stats per direction. n_universe excludes opposite-direction genes; n_discordant counts genes whose bulk and sn signs disagree.",
+             digits = c(0,0,0,0,0,0,0,4))
+```
+
+## Figure 5 — GO BP on the MTJ-bulk-only set `(canvas: 032, 038, 043, 048)`
+
+*Why this figure:* Q4 asks what kind of genes are Ribo-Tag-specific at the MTJ; functional enrichment of the Ribo-only set tests whether they form a coherent, MTJ-relevant biological class rather than a random residue, supporting a translational-control interpretation.
+
+*Method:* `run_GO()` GO BP on `ribo_only_MTJ` (universe = `joined$gene_name`); top-20 dotplot. The
+**top-5 genes per term** (ranked by `|ribo_LFC|`, the Ribo-Tag MTJ/CK8 LFC) are drawn outside the
+panel, with the legend below (canvas 032, 038), mirroring report 04's GO dotplots.
+
+```{r fig5_go, fig.width=15, fig.height=10}
+# top-5 genes per GO term, ranked by |Ribo-Tag MTJ/CK8 LFC| (canvas 032 -> 038; mirrors report 04)
+lfc_map = setNames(joined$ribo_LFC, joined$gene_name)
+top5_genes = function(geneID){
+    gs = strsplit(geneID, "/")[[1]]
+    gs = gs[order(-abs(lfc_map[gs]))]          # strongest Ribo-Tag responders first
+    paste(head(gs, 5), collapse = ", ")
+}
+# attach the top-5 genes per displayed term OUTSIDE the panel; legend below (canvas 038)
+annotate_top3 = function(p, go){
+    res_df = as.data.frame(go)
+    res_df$top5 = vapply(res_df$geneID, top5_genes, character(1))
+    pd = p$data
+    pd$top5 = res_df$top5[match(pd$Description, res_df$Description)]
+    xr = max(ggplot2::ggplot_build(p)$data[[1]]$x, na.rm = TRUE)
+    # gene labels in the right margin; cap panel x to the dots so they don't stretch the axis (canvas 043 -> 045)
+    p + geom_text(data = pd, aes(x = xr * 1.12, y = Description, label = top5),
+                  hjust = 0, size = 6.0, inherit.aes = FALSE) +
+        coord_cartesian(xlim = c(NA, xr * 1.05), clip = "off") +
+        theme(plot.margin = unit(c(5.5, 460, 5.5, 5.5), "pt"),
+              legend.position = "bottom", legend.box = "horizontal")
+}
+
+bulk_only_mtj = joined %>% filter(quadrant == "ribo_only_MTJ") %>%
+    pull(gene_name) %>% unique()
+cat(sprintf("GO inputs (canvas 048): %d genes (ribo_only_MTJ) vs universe %d (genes in the Ribo-Tag x Petrany-snRNA join `joined$gene_name` — the modality-overlap background, shared with Figs 6 & 8).\n",
+            length(bulk_only_mtj), length(unique(joined$gene_name))))
+
+if(length(bulk_only_mtj) >= 10){
+    go_res = run_GO(bulk_only_mtj,
+                    universe = joined$gene_name,
+                    ont = "BP")
+    if(!is.null(go_res) && nrow(as.data.frame(go_res)) > 0){
+        p = enrichplot::dotplot(go_res, showCategory = 20) +
+            ggtitle("GO BP — Ribo-Tag-only MTJ markers")
+        p = annotate_top3(p, go_res)
+        print(p)
+        ggsave(file.path(outpath, DateNamer("dotplot_GO_bulk_only_MTJ.pdf")),
+               p, width = 11, height = 10)
+        write.table(as.data.frame(go_res),
+            file = file.path(outpath, DateNamer("table_GO_bulk_only_MTJ.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+    }
+}
+```
+
+## Figure 6 — GO (BP & MF) on the Ribo-Tag-only CK8 set `(canvas: 025, 032, 038, 043, 046, 048)`
+
+*Why this figure:* the CK8-side mirror of Figure 5. Functional enrichment of the genes that are
+Ribo-Tag CK8-enriched but **not** enriched in the snRNA comparator tests whether a
+translational-only signature also exists on the CK8 side — the comparator for the reviewer's
+"is translational-only control MTJ-specific?" question (Q4).
+
+```{r fig6_go_ck8, fig.width=15, fig.height=10}
+ribo_only_ck8 = joined %>% filter(quadrant == "ribo_only_CK8") %>%
+    pull(gene_name) %>% unique()
+cat(sprintf("GO inputs (canvas 048): %d genes (ribo_only_CK8) vs universe %d (`joined$gene_name`, the modality-overlap background shared with Figs 5 & 8).\n",
+            length(ribo_only_ck8), length(unique(joined$gene_name))))
+
+if(length(ribo_only_ck8) >= 10){
+    for(ont in c("BP","MF")){
+        go_ck8 = run_GO(ribo_only_ck8, universe = joined$gene_name, ont = ont)
+        if(!is.null(go_ck8) && nrow(as.data.frame(go_ck8)) > 0){
+            p = enrichplot::dotplot(go_ck8, showCategory = 20) +
+                ggtitle(paste0("GO ", ont, " — Ribo-Tag-only CK8 markers"))
+            p = annotate_top3(p, go_ck8)          # top-5 genes per term (canvas 032, 038)
+            print(p)
+            ggsave(file.path(outpath, DateNamer(paste0("dotplot_GO_ribo_only_CK8_", ont, ".pdf"))),
+                   p, width = 11, height = 10)
+            write.table(as.data.frame(go_ck8),
+                file = file.path(outpath, DateNamer(paste0("table_GO_ribo_only_CK8_", ont, ".tsv"))),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+        } else {
+            cat("No enriched GO", ont, "terms for the Ribo-only-CK8 set.\n")
+        }
+    }
+} else {
+    cat("Fewer than 10 Ribo-only-CK8 genes (", length(ribo_only_ck8),
+        ") — GO skipped.\n")
+}
+```
+
+*Input:* the `ribo_only_CK8` quadrant of the Fig 3 `joined` table (canvas 046: Ribo-Tag Down in the
+MTJ/CK8 contrast = CK8-enriched, **not** Down in the snRNA contrast, **and** `ribo_LFC < sn_LFC`
+i.e. ribo more CK8-enriched than rna); GO universe = `joined$gene_name` (identical to Fig 5, so the
+MTJ-only and CK8-only enrichments are comparable).
+*Method:* `run_GO()` (clusterProfiler `enrichGO`, `org.Mm.eg.db`, BH `padj < 0.05`,
+`minGSSize = 10`, `maxGSSize = 500`) for ontologies **BP and MF**; top-20 dotplot + exported table
+per ontology; skipped with a message if fewer than 10 genes. The **top-5 genes per term** (ranked by
+`|ribo_LFC|`) are drawn outside the panel with the legend below (canvas 032, 038). The snRNA comparator is the
+**Petrany 2020** atlas (MTJ-vs-rest pseudobulk) — **not Kim**.
+*Caveat:* the snRNA arm is MTJ-vs-**rest**, so "CK8" here means Ribo-Tag CK8-enriched vs non-MTJ
+*rest* nuclei — 'rest' is a loose CK8 proxy (the CK8 fibre ⊂ rest, inherited from Figs 2-3); read
+as the CK8-side translational-only comparator, not a CK8-cluster-specific call.
+*Shows:* whether the Ribo-Tag-only CK8 set is functionally coherent, and how its enrichment
+compares to the MTJ-only set in Fig 5.
+
+## Figure 7 — Heatmap of bulk-only MTJ markers across Ribo cohort
+
+*Why this figure:* it verifies that the named Ribo-Tag-only MTJ genes are consistently and reproducibly enriched across the Ribo cohort replicates, so the genes offered as the translational-only answer to Q4 are robust calls rather than single-sample artefacts.
+
+```{r fig6_heatmap, fig.width=6, fig.height=10}
+top_bulk_only = joined %>%
+    filter(quadrant == "ribo_only_MTJ") %>%
+    arrange(-ribo_LFC) %>% head(50)
+
+if(nrow(top_bulk_only) >= 5){
+    dat = ribo$dat %>%
+        filter(gene_id %in% (annot %>%
+                             filter(gene_name %in% top_bulk_only$gene_name) %>%
+                             pull(gene_id))) %>%
+        dplyr::select(gene_name, contains("sample")) %>%
+        as.data.frame() %>%
+        magrittr::set_colnames(stringr::str_replace(colnames(.), "sample.", "")) %>%
+        magrittr::set_rownames(.$gene_name) %>%
+        dplyr::select(-gene_name)
+    mat = as.matrix(t(scale(t(log2(dat + 1)))))
+    h = ComplexHeatmap::Heatmap(mat,
+            show_row_dend = FALSE, show_column_dend = FALSE,
+            name = "z(log2 cnt)")
+    pdf(file.path(outpath, DateNamer("heatmap_ribo_only_MTJ.pdf")),
+        width = 6, height = 10)
+    ComplexHeatmap::draw(h)
+    dev.off()
+    ComplexHeatmap::draw(h)
+}
+```
+
+## Figure 8 — GO (BP & MF) on the snRNA-only MTJ set `(canvas: 025, 038, 040, 043, 048, 049)`
+
+*Why this figure:* the transcription-only counterpart to Fig 6 — functional enrichment of genes
+called MTJ-up in snRNA but not in Ribo-Tag, completing the modality-specific GO comparison
+(Ribo-only-MTJ Fig 5, Ribo-only-CK8 Fig 6, snRNA-only-MTJ here).
+
+```{r fig9_go_sn_only_mtj, fig.width=15, fig.height=10}
+sn_only_mtj = joined %>% filter(quadrant == "sn_only_MTJ") %>% pull(gene_name) %>% unique()
+go_universe = unique(joined$gene_name)
+cat(sprintf("GO inputs (canvas 048/049): %d genes (sn_only_MTJ) vs universe %d (`joined$gene_name`, the Ribo-Tag x Petrany-snRNA modality-overlap background, shared with Figs 5 & 6).\n",
+            length(sn_only_mtj), length(go_universe)))
+# export the genes that go into this GO (canvas 049)
+write.table(data.frame(gene_name = sort(sn_only_mtj)),
+    file = file.path(outpath, DateNamer("table_genes_sn_only_MTJ.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+if(length(sn_only_mtj) >= 10){
+    for(ont in c("BP","MF")){
+        go_sn = run_GO(sn_only_mtj, universe = joined$gene_name, ont = ont)
+        if(!is.null(go_sn) && nrow(as.data.frame(go_sn)) > 0){
+            p = enrichplot::dotplot(go_sn, showCategory = 20) +
+                ggtitle(paste0("GO ", ont, " — snRNA-only MTJ markers"))
+            p = annotate_top3(p, go_sn)          # top-5 genes per term, same as Figs 5/6 (canvas 040)
+            print(p)
+            ggsave(file.path(outpath, DateNamer(paste0("dotplot_GO_sn_only_MTJ_", ont, ".pdf"))),
+                   p, width = 13, height = 10)
+            write.table(as.data.frame(go_sn),
+                file = file.path(outpath, DateNamer(paste0("table_GO_sn_only_MTJ_", ont, ".tsv"))),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+        } else {
+            cat("No enriched GO", ont, "terms for the snRNA-only MTJ set.\n")
+        }
+    }
+} else {
+    cat("Fewer than 10 snRNA-only MTJ genes (", length(sn_only_mtj), ") — GO skipped.\n")
+}
+```
+
+*Input:* the `sn_only_MTJ` quadrant (snRNA MTJ-up but not Ribo-Tag MTJ-up); universe = `joined$gene_name`.
+*Method:* `run_GO()` (enrichGO BP & MF, BH padj<0.05); top-20 dotplot + table per ontology;
+skipped with a message if fewer than 10 genes. snRNA = Petrany (MTJ-vs-rest). The **top-5 genes per
+term** (by `|ribo_LFC|`) are drawn outside the panel with the legend below — the same `annotate_top3`
+treatment as Figs 5/6 (canvas 038, 040).
+*Shows:* the biology of the transcription-only MTJ selection, to contrast with the Ribo-only sets.
+
+### Figure 8b — sn_only_MTJ vs the lab MTJ markers `(canvas: 049)`
+
+*Why this:* checks whether the transcription-only MTJ set (the Fig-8 GO genes) recovers the lab's
+own established MTJ markers — overlap + enrichment against the same GO universe.
+
+```{r fig8_marker_overlap, fig.width=5, fig.height=5}
+lab_markers = readxl::read_excel(
+                  file.path(.scripts.path, "Documentation", "MTJ marker genes from our study.xlsx"),
+                  sheet = "MTJ")$Gene
+lab_markers = unique(lab_markers[!is.na(lab_markers) & nzchar(lab_markers)])
+lab_in_univ = intersect(lab_markers, go_universe)          # markers present in the GO background
+ovl         = intersect(sn_only_mtj, lab_markers)
+# hypergeometric enrichment of the overlap, background = go_universe (the GO universe)
+p_hyper = phyper(length(ovl) - 1, length(lab_in_univ),
+                 length(go_universe) - length(lab_in_univ),
+                 length(intersect(sn_only_mtj, go_universe)), lower.tail = FALSE)
+cat(sprintf("sn_only_MTJ = %d | lab markers = %d (%d in universe) | overlap = %d | hyper p = %.3g\n",
+            length(sn_only_mtj), length(lab_markers), length(lab_in_univ), length(ovl), p_hyper))
+
+knitr::kable(data.frame(
+    set = c("sn_only_MTJ", "lab MTJ markers", "lab markers in universe", "overlap", "hypergeometric p"),
+    value = c(length(sn_only_mtj), length(lab_markers), length(lab_in_univ), length(ovl),
+              signif(p_hyper, 3))),
+    caption = "Overlap of the Fig-8 sn_only_MTJ gene set with the lab MTJ markers (Documentation/MTJ marker genes from our study.xlsx, sheet MTJ). Hypergeometric background = the GO universe joined$gene_name.")
+
+write.table(data.frame(gene_name = sort(union(sn_only_mtj, lab_markers))) %>%
+              dplyr::mutate(in_sn_only_MTJ = gene_name %in% sn_only_mtj,
+                            in_lab_markers = gene_name %in% lab_markers,
+                            in_universe    = gene_name %in% go_universe),
+    file = file.path(outpath, DateNamer("table_sn_only_MTJ_vs_lab_markers.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+
+vv = venn.diagram(list(`sn_only_MTJ` = sn_only_mtj, `lab MTJ markers` = lab_markers),
+                  filename = NULL, fill = c("#1F77B4", "#E88C8C"), alpha = 0.5,
+                  cex = 1.5, cat.cex = 1.1)
+grid.newpage(); grid.draw(vv)
+pdf(file.path(outpath, DateNamer("venn_sn_only_MTJ_vs_lab_markers.pdf")), width = 5, height = 5)
+grid.draw(vv); dev.off()
+```
+
+*Input:* the Fig-8 `sn_only_MTJ` gene set vs the 132 lab MTJ markers (`Documentation/MTJ marker
+genes from our study.xlsx`, sheet `MTJ`, column `Gene`).
+*Method:* set overlap + a hypergeometric enrichment test (`phyper`) with background = the GO
+universe `joined$gene_name`; per-gene membership exported; 2-set Venn.
+*Shows:* whether the transcription-only MTJ calls recover the lab's known MTJ markers, and whether
+that overlap is more than chance against the modality-overlap background.
+
+## Figure 9 — Scatter labelled by the translational-only / transcription-only selections `(canvas: 025, 033, 046)`
+
+*Why this figure:* names the genes in the two modality-specific selections directly on the Fig 3
+axes — one panel labels only `sn_only_MTJ`, the other only `ribo_only_CK8` — so each translational-
+only / transcription-only call is legible gene-by-gene.
+
+```{r fig10_labeled_scatters, fig.width=6, fig.height=5}
+labeled_scatter = function(highlight){
+    hi = dplyr::filter(joined, quadrant == highlight)
+    # label only the top 25 per panel, ranked by the panel's defining axis (canvas 033):
+    #   sn_only_MTJ   -> most snRNA-MTJ-up (descending sn_LFC)
+    #   ribo_only_CK8 -> most Ribo-Tag-CK8 (ascending ribo_LFC = most negative first)
+    hi_lab = if(highlight == "sn_only_MTJ") dplyr::arrange(hi, desc(sn_LFC)) else
+                                            dplyr::arrange(hi, ribo_LFC)
+    hi_lab = head(hi_lab, 25)
+    ggplot(joined, aes(sn_LFC, ribo_LFC)) +
+        geom_point(color = "lightgray", size = 0.5, alpha = 0.5) +
+        geom_point(data = hi, color = quad_cols[[highlight]], size = 0.8) +
+        ggrepel::geom_text_repel(data = hi_lab, aes(label = gene_name), size = 2.2, color = "black",
+                                 max.overlaps = Inf, min.segment.length = 0, segment.size = 0.2) +
+        geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+        geom_hline(yintercept = 0, linewidth = 0.25) +
+        geom_vline(xintercept = 0, linewidth = 0.25) +
+        labs(x = "log2 LFC (snRNA MTJ vs rest)", y = "log2 LFC (Ribo-Tag MTJ vs CK8)",
+             title = paste0("labelled (top ", nrow(hi_lab), "): ", highlight,
+                            "  (n=", nrow(hi), ")")) +
+        globals$theme
+}
+for(q in c("sn_only_MTJ","ribo_only_CK8")){
+    g = labeled_scatter(q); print(g)
+    ggsave(file.path(outpath, DateNamer(paste0("scatter_LFC_labeled_", q, ".pdf"))), g, width = 6, height = 5)
+}
+```
+
+*Input:* the Fig 3 `joined` table; one panel per target quadrant (`sn_only_MTJ`, `ribo_only_CK8`).
+*Method:* the Fig-3 LFC scatter with all genes in light grey and only the target quadrant coloured
+(its Fig-3 colour); **all** quadrant genes are drawn as points, but only the **top 25** are
+text-labelled (canvas 033) — ranked by the panel's defining axis (`sn_only_MTJ` by descending
+`sn_LFC`; `ribo_only_CK8` by ascending `ribo_LFC`, most negative first). Both `ribo_only` sets use
+the canvas-046 ribo-vs-rna definition (`ribo_LFC > sn_LFC` for MTJ, `< sn_LFC` for CK8).
+*Shows:* the explicit gene membership of the transcription-only-MTJ and translational-only-CK8
+selections.
+
+## Figure 10 — Cross-dataset MTJ concordance (Kim 17 vs Petrany 26) `(canvas: 057)`
+
+*Why this figure:* ported from report 05 — does the MTJ signature reproduce across two independent
+published atlases? Each dot is a gene; x = its Petrany cluster-26-vs-rest log2FC, y = its Kim
+cluster-17-vs-rest log2FC. Genes near the diagonal agree between datasets. We label the top-10
+**concordant** genes (highest `kim + pet`, agree-and-MTJ) and the top-10 **discordant** genes (largest
+`|kim − pet|`, atlas-specific), with Col22a1/Tigd4 as anchors.
+
+```{r fig10_crossdataset, fig.width=5.5, fig.height=5.5}
+kim = load_kim_birchmeier_2020()
+kim_mtj = top_marker_cluster(kim, "Col22a1")
+if(!identical(kim_mtj, "17")) message("WARNING: Kim Col22a1-top cluster is ", kim_mtj, " (expected 17)")
+stopifnot("17" %in% levels(kim$seurat_clusters))   # guard: pinned Kim MTJ cluster exists
+
+# cluster-vs-rest log2FC in each atlas' MTJ cluster (Petrany 26 = the pinned `sn` MTJ cluster, Kim 17),
+# restricted to genes detected in >10% of nuclei in BOTH MTJ clusters (drops one-atlas detection artefact)
+lfc_kim = cluster_vs_rest_lfc(kim, kim_mtj)     %>% dplyr::select(gene_name, kim = avg_log2FC, kim_pct = pct.1)
+lfc_pet = cluster_vs_rest_lfc(sn,  mtj_cluster) %>% dplyr::select(gene_name, pet = avg_log2FC, pet_pct = pct.1)
+cross = inner_join(lfc_kim, lfc_pet, by = "gene_name") %>% filter(kim_pct > 0.1, pet_pct > 0.1)
+rho   = suppressWarnings(cor(cross$kim, cross$pet, method = "spearman"))
+
+concord = cross %>% arrange(desc(kim + pet))      %>% head(10)   # top-10 concordant (both high)
+discord = cross %>% arrange(desc(abs(kim - pet))) %>% head(10)   # top-10 discordant (atlas-specific)
+anchors = cross %>% filter(gene_name %in% c("Col22a1","Tigd4"))
+cat(sprintf("Cross-dataset MTJ concordance: %d genes (both pct>0.1) | Spearman rho = %.2f | top concordant: %s | top discordant: %s\n",
+            nrow(cross), rho, paste(head(concord$gene_name,5), collapse=","), paste(head(discord$gene_name,5), collapse=",")))
+
+g10 = ggplot(cross, aes(pet, kim)) +
+    geom_point(size = 0.4, alpha = 0.5, color = "lightgray") +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.25) +
+    geom_point(data = concord, color = "#2CA02C", size = 1.6) +
+    geom_point(data = discord, color = "#D62728", size = 1.6) +
+    geom_point(data = anchors, color = "#1F77B4", size = 1.8) +
+    ggrepel::geom_text_repel(data = dplyr::distinct(dplyr::bind_rows(concord, discord, anchors)),
+        aes(label = gene_name), size = 2.8, max.overlaps = 30, min.segment.length = 0) +
+    labs(x = sprintf("Petrany cluster %s vs rest (log2FC)", mtj_cluster),
+         y = sprintf("Kim cluster %s vs rest (log2FC)", kim_mtj),
+         title = sprintf("MTJ concordance — Spearman rho = %.2f (n = %d)", rho, nrow(cross))) +
+    globals$theme
+print(g10)
+ggsave(file.path(outpath, DateNamer("scatter_crossdataset_MTJ_kim_vs_petrany.pdf")), g10, width = 5.5, height = 5.5)
+
+cross_out = cross %>% mutate(concordance = kim + pet, discordance = abs(kim - pet)) %>% arrange(desc(concordance))
+write.table(cross_out, file = file.path(outpath, DateNamer("table_crossdataset_MTJ_kim_vs_petrany.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# positive control: Col22a1 (canonical MTJ marker) must be concordant (both atlases LFC > 0)
+col22_row = cross %>% filter(gene_name == "Col22a1")
+stopifnot(nrow(col22_row) == 1, col22_row$kim > 0, col22_row$pet > 0)
+if("Tigd4" %in% cross$gene_name)
+    message("Tigd4 cross-dataset LFC — Kim: ", round(cross$kim[cross$gene_name=="Tigd4"],2),
+            "  Petrany: ", round(cross$pet[cross$gene_name=="Tigd4"],2))
+```
+
+*Input:* cluster-vs-rest log2FC for the MTJ cluster in each atlas (Kim 17, Petrany 26 = the pinned `sn`
+MTJ cluster), restricted to genes detected in >10% of nuclei in **both** MTJ clusters. *Method:*
+`cluster_vs_rest_lfc` (depth-normalized LFC) per atlas; Spearman ρ; concordant = top-10 by `kim + pet`
+(green), discordant = top-10 by `|kim − pet|` (red), Col22a1/Tigd4 anchors (blue); dashed y=x. Exports
+`table_crossdataset_MTJ_kim_vs_petrany.tsv` (with `concordance`/`discordance` columns). *Shows:* whether
+the MTJ enrichment signature reproduces across atlases — Col22a1/Tigd4 sit concordant upper-right; the
+red genes flag atlas-specific calls. *Oracle:* ρ should match report 05's Figure 5 for the same clusters.
+
+## Export joined per-gene table
+
+```{r}
+write.table(joined,
+    file = file.path(outpath, DateNamer("table_per_gene_modality_join.tsv")),
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

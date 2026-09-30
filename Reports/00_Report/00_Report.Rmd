@@ -1,0 +1,66 @@
+---
+title: "00 — MKim_MTJ: summary & report index"
+author: "MKim_MTJ"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+> **Role.** This is the project index report: it summarises every reviewer
+> question (Q1–Q6) and links to the single report that answers each, providing
+> the canonical question-to-deliverable map for the MKim_MTJ submission.
+
+<!--
+# Canvas: Prompts/canvases/000_report.md
+Summary report. Keep in sync with Prompts/implementation.md after every
+new phase is knit. Link targets are relative to this .Rmd, which sits in
+Scripts/Reports/00_Report/.
+-->
+
+## Project
+
+Characterize mRNAs with differential translation in myotendinous junction
+(MTJ) nuclei vs whole myofibers (CK8+) in mouse, sedentary vs exercise.
+Integrate with bulk RNA-seq (CK8 vs Tigd4), Tigd4 RIP-seq, and mass spec.
+
+## Cohorts
+
+- **riboseq_sedentary** — 16 samples, MTJ/CK8 × GFP.L10/HA.Rpl22 × input/pulldown × br1-4 (one br2 MTJ-HA.Rpl22 drop-out).
+- **riboseq_exercise** — 10 samples, MTJ/CK8 × HA pulldown / Input, br1-3 (variable).
+- **rnaseq** — 8 samples, CK8 × 4 vs Tigd4 × 4. Tigd4_br2 dropped in DE.
+
+See `Documentation/sample_sheet.tsv` for the complete row-by-row metadata.
+
+## Reports
+
+| # | Report | Purpose | Output |
+|---|--------|---------|--------|
+| 01 | `01_sample_sheet_QC` | Library sizes, PCA, sample correlations per cohort | `Results/01_sample_sheet_QC/` |
+| 02 | `02_sedentary_DE` | Reviewer Q6 — translatome-vs-transcriptome specificity: per-cell-type translation efficiency (DESeq2-normalized Ribo/RNA), TE_MTJ-vs-TE_CK8 scatter, differential-TE heatmap/gene-list, vs published Kim/Birchmeier MTJ signature | `Results/02_sedentary_DE/` |
+| 03 | `03_bulk_downregulated` | Reviewer Q3 — down genes in bulk Tigd4 vs CK8 + GO | `Results/03_bulk_downregulated/` |
+| 04 | `04_exercise_DE` | Reviewer Q5 — translational response classes, GO on `up_EXE_only` / `down_EXE_only` | `Results/04_exercise_DE/` |
+| 05 | `05_tigd4_specificity_snRNA` | Reviewer Q1 — Tigd4 % per cluster across Kim 2020, Petrany 2020, De Micheli 2020 atlases | `Results/05_tigd4_specificity_snRNA/` |
+| 07 | `07_ribotag_vs_snRNA` | Reviewer Q4 — Ribo-Tag vs snRNA pseudobulk concordance, hypergeometric test | `Results/07_ribotag_vs_snRNA/` |
+| 08 | `08_klf2dn_snRNA` | KLF2 dominant-negative snRNA (8 libs, 4 paired mice) — per-sample top-Tigd4 MTJ call + doublet/ambient QC + **MTJ composition** (%MTJ Cre vs KLF2-DN, paired) + **transduction**. Trend: %MTJ lower in KLF2-DN in all 4 mice (p≈0.11, ns); MTJ doublet-enriched (interface artifact), ambient negligible. **KLF2-DN detected in DN legs** via condition-specific references (Cre legs→Cre ref, DN legs→DN ref; a combined ref multimaps the shared AAV backbone→0), strongly MTJ-localized. *(Paired pseudobulk DE was a clean null — dropped 2026-07-27; in git history.)* | `Results/08_klf2dn_snRNA/` |
+
+*(Report 06 retired 2026-06-15 — its reviewer-Q2 content was split across two reports: the sedentary translation-efficiency analysis lives in report 02, and the exercise sedentary-vs-trained TE figure was moved into report 04 (Figure 7) on 2026-06-16.)*
+
+## Reviewer question ↔ deliverable map
+
+Reviewer questions are mapped to reports in `Prompts/comments.md`.
+
+| Reviewer Q | Where answered | Status |
+|------------|----------------|--------|
+| Q1 — Tigd4 specificity (MTJ vs fibroblast/tenocyte) | Report 05 | knit |
+| Q2 — Ribo normalized by RNA | Report 02 (sedentary TE) + Report 04 (exercise sed-vs-trained figure) | knit |
+| Q3 — downregulated genes in bulk Tigd4 vs CK8 | Report 03 | knit |
+| Q4 — Ribo-Tag vs snRNA marker concordance | Report 07 | knit |
+| Q5 — translational gene classes in exercise | Report 04 | knit |
+| Q6 — translatome-vs-transcriptome + published MTJ comparison | Report 02 | knit (TE overhaul, 2026-06-09) |
+
+## How to regenerate
+
+1. Check R environment with `R45` (`/opt/R/4.5/bin/R`): `renv::status()` in `/home/vfranke/Projects/MKim_MTJ` (renv rebuilt on R 4.5 / Bioc 3.21).
+2. Knit each report from `Scripts/Reports/<NN_name>/<NN_name>.Rmd` (or `Scripts/Bin/knit_all.R` for all); output lands in `Results/<NN_name>/yymmdd_*/`.
+3. Update `Prompts/implementation.md`, `Prompts/dependencies.json`, and this index after each knit.
