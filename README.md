@@ -1,8 +1,10 @@
 # MKim_MTJ — analysis code archive
 
-Code and processed supporting tables for the myotendinous-junction (MTJ)
-translatome / single-nucleus study (Kim & Franke). This is the archival code
-deposit that accompanies the manuscript's *Data and Code Availability* statement.
+Code and processed supporting tables for *Local translational program at the
+muscle–tendon junction endows domain identity in muscle syncytia* (de Carvalho
+Neves et al., bioRxiv 2026) — a study of the muscle–tendon junction (MTJ)
+translatome and single-nucleus transcriptome. This is the archival code deposit
+that accompanies the manuscript's *Data and Code Availability* statement.
 
 > **AI-assistance disclosure.** This analysis code was written with the help of
 > AI (Anthropic's Claude, via Claude Code). All analyses, figures, and
